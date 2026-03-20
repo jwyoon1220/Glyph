@@ -1,7 +1,9 @@
 package io.github.jwyoon1220.glyph
 
+import com.formdev.flatlaf.FlatDarculaLaf
 import io.github.jwyoon1220.glyph.data.StorageRepository
 import io.github.jwyoon1220.glyph.search.DictionaryClient
+import io.github.jwyoon1220.glyph.search.FileWatcher
 import io.github.jwyoon1220.glyph.search.LuceneSearcher
 import io.github.jwyoon1220.glyph.vcs.GitManager
 import kotlinx.coroutines.*
@@ -15,10 +17,12 @@ import javax.swing.border.EmptyBorder
 class GlyphMainFrame : JFrame("Glyph - Narrative Development Environment") {
 
     // Services
-    private val repo = StorageRepository(File(System.getProperty("user.dir"), "glyph_data"))
-    private val gitManager = GitManager(File(System.getProperty("user.dir"), "glyph_data"))
+    private val dataRoot = File(System.getProperty("user.dir"), "glyph_data")
+    private val repo = StorageRepository(dataRoot)
+    private val gitManager = GitManager(dataRoot)
     private val dictClient = DictionaryClient()
     private val luceneSearcher = LuceneSearcher()
+    private val fileWatcher = FileWatcher(dataRoot, luceneSearcher, repo)
 
     private val rootPanel = JPanel(BorderLayout())
     private val centerEditorArea = GlyphTextArea(dictClient)
@@ -37,56 +41,50 @@ class GlyphMainFrame : JFrame("Glyph - Narrative Development Environment") {
         rootPanel.background = Color(43, 43, 43)
         rootPanel.add(createCustomTitleBar(), BorderLayout.NORTH)
         
-        // Split Panes for IntelliJ Style Tool Windows
-        val rightToolWindow = createDictionaryToolWindow()
-        val leftToolWindow = createProjectToolWindow()
-        val bottomToolWindow = createVersionControlToolWindow()
+        // Build the tool-window layout via ToolWindowManager (interface-based injection)
+        val toolWindowManager = ToolWindowManager(
+            left   = object : ToolWindowPanel { override val component = createProjectToolWindow() },
+            center = object : ToolWindowPanel { override val component = centerEditorArea },
+            right  = object : ToolWindowPanel { override val component = createCharacterToolWindow() },
+            bottom = object : ToolWindowPanel { override val component = createVersionControlToolWindow() }
+        )
+        rootPanel.add(toolWindowManager.buildLayout(), BorderLayout.CENTER)
 
-        // Center split with bottom
-        val centerBottomSplit = JSplitPane(JSplitPane.VERTICAL_SPLIT, centerEditorArea, bottomToolWindow).apply {
-            resizeWeight = 0.8
-            dividerSize = 4
-            border = null
-        }
-        
-        // Left split
-        val leftCenterSplit = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftToolWindow, centerBottomSplit).apply {
-            resizeWeight = 0.2
-            dividerSize = 4
-            border = null
-        }
-        
-        // Right split
-        val mainSplit = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftCenterSplit, rightToolWindow).apply {
-            resizeWeight = 0.8
-            dividerSize = 4
-            border = null
-        }
-
-        rootPanel.add(mainSplit, BorderLayout.CENTER)
         WindowResizer(rootPanel)
         contentPane = rootPanel
 
-        // Start Auto-Save / Git Commit Background Job
-        startAutoCommitJob()
+        // Wire up typing-inactivity auto-commit
+        centerEditorArea.addTypingStoppedListener {
+            uiScope.launch(Dispatchers.IO) {
+                gitManager.commitAll("Auto-save snapshot")
+            }
+        }
+
+        // Wire up Ctrl+Z git-based undo
+        centerEditorArea.onUndoRequested = ::performGitUndo
+
+        // Start the file watcher for real-time Lucene indexing
+        fileWatcher.start()
     }
 
-    private fun startAutoCommitJob() {
-        uiScope.launch {
-            while (isActive) {
-                delay(60000) // Commit every 60 seconds of inactivity (simplified)
-                gitManager.commitAll("Auto-save snapshot")
+    private fun performGitUndo() {
+        val history = gitManager.getUndoHistory()
+        if (history.size >= 2) {
+            try {
+                gitManager.restoreSnapshot(history[1])
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }
 
     // --- TOOL WINDOWS ---
 
-    private fun createDictionaryToolWindow(): JPanel {
+    private fun createCharacterToolWindow(): JPanel {
         val panel = JPanel(BorderLayout())
         panel.background = Color(60, 63, 65)
         panel.preferredSize = Dimension(300, 0)
-        panel.border = BorderFactory.createTitledBorder(BorderFactory.createLineBorder(Color.DARK_GRAY), "Dictionary")
+        panel.border = BorderFactory.createTitledBorder(BorderFactory.createLineBorder(Color.DARK_GRAY), "Character / World Settings")
         (panel.border as javax.swing.border.TitledBorder).titleColor = Color.LIGHT_GRAY
 
         val topBar = JPanel(BorderLayout())
@@ -120,8 +118,8 @@ class GlyphMainFrame : JFrame("Glyph - Narrative Development Environment") {
                     } else {
                         val sb = StringBuilder()
                         for (item in results) {
-                            sb.append("【\${item.word}】 " + if (item.pos.isNotEmpty()) "[\${item.pos}]\n" else "\n")
-                            sb.append("\${item.sense.definition}\n\n")
+                            sb.append("【${item.word}】 " + if (item.pos.isNotEmpty()) "[${item.pos}]\n" else "\n")
+                            sb.append("${item.sense.definition}\n\n")
                         }
                         resultArea.text = sb.toString()
                     }
@@ -142,8 +140,8 @@ class GlyphMainFrame : JFrame("Glyph - Narrative Development Environment") {
         (panel.border as javax.swing.border.TitledBorder).titleColor = Color.LIGHT_GRAY
 
         val listModel = DefaultListModel<String>()
-        listModel.addElement("Chapter 1.txt")
-        listModel.addElement("Chapter 2.txt")
+        listModel.addElement("Chapter 1.md")
+        listModel.addElement("Chapter 2.md")
         listModel.addElement("ProjectSettings.glb")
 
         val list = JList(listModel)
@@ -261,7 +259,7 @@ fun main() {
     System.setProperty("swing.aatext", "true")
     
     SwingUtilities.invokeLater {
-        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
+        FlatDarculaLaf.setup()
         val frame = GlyphMainFrame()
         frame.isVisible = true
     }

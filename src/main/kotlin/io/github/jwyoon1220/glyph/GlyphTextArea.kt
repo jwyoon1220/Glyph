@@ -19,7 +19,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
 
     private val pieceTable = PieceTable()
     private val uiScope = CoroutineScope(Dispatchers.Swing + Job())
-    
+
     private var caretOffset = 0
     private var selectionStart = -1
     private var selectionEnd = -1
@@ -29,6 +29,27 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
 
     private var hoveredWordBounds: IntRange? = null
     private var popupWindow: JPopupMenu? = null
+
+    /** Listeners notified after a period of typing inactivity (for auto-commit). */
+    private val typingStoppedListeners = mutableListOf<() -> Unit>()
+    private var inactivityTimer: Timer? = null
+
+    /** Optional undo handler supplied by the owner (e.g. git-based restore). */
+    var onUndoRequested: (() -> Unit)? = null
+
+    fun addTypingStoppedListener(listener: () -> Unit) {
+        typingStoppedListeners.add(listener)
+    }
+
+    private fun resetInactivityTimer() {
+        inactivityTimer?.stop()
+        inactivityTimer = Timer(3000) {
+            typingStoppedListeners.forEach { it() }
+        }.also {
+            it.isRepeats = false
+            it.start()
+        }
+    }
 
     init {
         isFocusable = true
@@ -64,6 +85,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
                     if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
                     pieceTable.insert(caretOffset, comText)
                     caretOffset += comText.length
+                    resetInactivityTimer()
                 }
                 
                 compositionText = if (composed.length > committed) composed.substring(committed) else ""
@@ -86,6 +108,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
                     pieceTable.insert(caretOffset, c.toString())
                     caretOffset++
                     showCaret = true
+                    resetInactivityTimer()
                     repaint()
                 }
             }
@@ -115,6 +138,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
                         pieceTable.insert(caretOffset, "\n")
                         caretOffset++
                         clearSelection()
+                        resetInactivityTimer()
                     }
                     KeyEvent.VK_BACK_SPACE -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) {
@@ -123,6 +147,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
                             pieceTable.delete(caretOffset - 1, 1)
                             caretOffset--
                         }
+                        resetInactivityTimer()
                     }
                     KeyEvent.VK_DELETE -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) {
@@ -130,6 +155,11 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
                         } else if (caretOffset < pieceTable.length) {
                             pieceTable.delete(caretOffset, 1)
                         }
+                        resetInactivityTimer()
+                    }
+                    KeyEvent.VK_Z -> if (ctrl) {
+                        onUndoRequested?.invoke()
+                        return
                     }
                     KeyEvent.VK_A -> if (ctrl) {
                         selectionStart = 0

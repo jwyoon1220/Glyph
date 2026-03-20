@@ -15,6 +15,8 @@ dependencies {
     testImplementation(kotlin("test"))
     // Source: https://mvnrepository.com/artifact/org.eclipse.jgit/org.eclipse.jgit
     implementation("org.eclipse.jgit:org.eclipse.jgit:7.6.0.202603022253-r")
+    // Source: https://mvnrepository.com/artifact/com.formdev/flatlaf
+    implementation("com.formdev:flatlaf:3.6")
     // Source: https://mvnrepository.com/artifact/org.jetbrains.kotlinx/kotlinx-coroutines-core
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
