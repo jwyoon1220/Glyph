@@ -11,6 +11,22 @@ data class Character(
 )
 
 @Serializable
+data class Place(
+    val id: String,
+    val name: String,
+    val description: String,
+    val tags: List<String> = emptyList()
+)
+
+@Serializable
+data class Item(
+    val id: String,
+    val name: String,
+    val description: String,
+    val tags: List<String> = emptyList()
+)
+
+@Serializable
 data class WorldSetting(
     val id: String,
     val title: String,
@@ -21,5 +37,7 @@ data class WorldSetting(
 data class ProjectSettings(
     val projectName: String,
     val characters: List<Character> = emptyList(),
+    val places: List<Place> = emptyList(),
+    val items: List<Item> = emptyList(),
     val worldSettings: List<WorldSetting> = emptyList()
 )
