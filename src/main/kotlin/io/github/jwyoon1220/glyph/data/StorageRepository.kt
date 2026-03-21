@@ -7,10 +7,20 @@ import kotlinx.serialization.decodeFromByteArray
 import kotlinx.serialization.encodeToByteArray
 import kotlinx.serialization.protobuf.ProtoBuf
 import kotlinx.serialization.Serializable
-import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.AsynchronousFileChannel
 import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.suspendCoroutine
 
 @Serializable
 data class EpisodeData(
@@ -23,17 +33,65 @@ class StorageRepository(private val rootDirectory: File) {
     companion object {
         private const val SMALL_FILE_THRESHOLD = 2 * 1024 * 1024L // 2 MB
 
-        /** Reads a file: BufferedInputStream for ≤2MB, mmap for larger. */
-        fun readFileBytes(file: File): ByteArray {
-            return if (file.length() <= SMALL_FILE_THRESHOLD) {
-                BufferedInputStream(file.inputStream()).use { it.readAllBytes() }
-            } else {
-                RandomAccessFile(file, "r").use { raf ->
-                    raf.channel.use { channel ->
-                        val buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
-                        ByteArray(buf.remaining()).also { buf.get(it) }
+        /**
+         * Fast file read:
+         *  - ≤2 MB: [AsynchronousFileChannel] with a single async read into a pooled ByteBuffer
+         *  - >2 MB: memory-mapped read via [FileChannel.map] (zero-copy, OS-paged)
+         */
+        suspend fun readFileBytes(file: File): ByteArray = withContext(Dispatchers.IO) {
+            val size = file.length()
+            if (size == 0L) return@withContext ByteArray(0)
+
+            if (size <= SMALL_FILE_THRESHOLD) {
+                // Async channel read — kernel queues the IO and signals completion
+                val path = file.toPath()
+                val buf  = ByteBuffer.allocateDirect(size.toInt())
+                val ch   = AsynchronousFileChannel.open(path, StandardOpenOption.READ)
+                try {
+                    suspendCoroutine<Int> { cont ->
+                        ch.read(buf, 0L, Unit, object : java.nio.channels.CompletionHandler<Int, Unit> {
+                            override fun completed(result: Int, attachment: Unit) = cont.resume(result)
+                            override fun failed(exc: Throwable, attachment: Unit) = cont.resumeWithException(exc)
+                        })
                     }
+                    buf.flip()
+                    ByteArray(buf.remaining()).also { buf.get(it) }
+                } finally {
+                    ch.close()
                 }
+            } else {
+                // Memory-mapped: OS maps file pages on demand — best for multi-MB files
+                FileChannel.open(file.toPath(), StandardOpenOption.READ).use { channel ->
+                    val mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
+                    ByteArray(mapped.remaining()).also { mapped.get(it) }
+                }
+            }
+        }
+
+        /**
+         * Crash-safe atomic write: write to a sibling temp file, then atomically
+         * rename it into place. A partial write can never corrupt the target file.
+         */
+        private fun writeAtomically(file: File, bytes: ByteArray) {
+            val tmp = File(file.parent, ".~${file.name}.tmp")
+            try {
+                // Write with DSYNC to flush to the storage device before rename
+                FileChannel.open(
+                    tmp.toPath(),
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.DSYNC
+                ).use { ch ->
+                    val buf = ByteBuffer.wrap(bytes)
+                    while (buf.hasRemaining()) ch.write(buf)
+                }
+                Files.move(
+                    tmp.toPath(), file.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                // Fallback on filesystems that don't support atomic move (e.g. cross-device)
+                tmp.copyTo(file, overwrite = true)
+                tmp.delete()
             }
         }
     }
@@ -49,7 +107,7 @@ class StorageRepository(private val rootDirectory: File) {
     @OptIn(ExperimentalSerializationApi::class)
     suspend fun saveSettings(settings: ProjectSettings) = withContext(Dispatchers.IO) {
         val bytes = ProtoBuf.encodeToByteArray(settings)
-        settingsFile.writeBytes(bytes)
+        writeAtomically(settingsFile, bytes)
     }
 
     @OptIn(ExperimentalSerializationApi::class)
@@ -64,11 +122,19 @@ class StorageRepository(private val rootDirectory: File) {
     suspend fun saveFile(relativePath: String, content: String) = withContext(Dispatchers.IO) {
         val file = File(rootDirectory, relativePath)
         file.parentFile?.mkdirs()
-        if (file.name.endsWith(".gle")) {
-            val episode = EpisodeData(file.nameWithoutExtension, content)
-            file.writeBytes(ProtoBuf.encodeToByteArray(episode))
-        } else {
-            file.writeText(content)
+        when {
+            file.name.endsWith(".gle") -> {
+                val episode = EpisodeData(file.nameWithoutExtension, content)
+                writeAtomically(file, ProtoBuf.encodeToByteArray(episode))
+            }
+            file.name.endsWith(".glh") -> {
+                // Glyph Header: gzip-compressed UTF-8 markdown
+                val raw = content.toByteArray(Charsets.UTF_8)
+                val out = ByteArrayOutputStream(raw.size / 2 + 64)
+                GZIPOutputStream(out).use { it.write(raw) }
+                writeAtomically(file, out.toByteArray())
+            }
+            else -> writeAtomically(file, content.toByteArray(Charsets.UTF_8))
         }
     }
 
@@ -77,18 +143,31 @@ class StorageRepository(private val rootDirectory: File) {
     suspend fun loadFile(relativePath: String): String = withContext(Dispatchers.IO) {
         val file = File(rootDirectory, relativePath)
         if (!file.exists()) return@withContext ""
-        if (file.name.endsWith(".gle")) {
-            try {
-                val bytes = readFileBytes(file)
-                if (bytes.isEmpty()) return@withContext ""
-                val episode = ProtoBuf.decodeFromByteArray<EpisodeData>(bytes)
-                episode.content
-            } catch (e: Exception) {
-                e.printStackTrace()
-                ""
+        when {
+            file.name.endsWith(".gle") -> {
+                try {
+                    val bytes = readFileBytes(file)
+                    if (bytes.isEmpty()) return@withContext ""
+                    val episode = ProtoBuf.decodeFromByteArray<EpisodeData>(bytes)
+                    episode.content
+                } catch (_: Exception) {
+                    // Fallback: try reading as plain text (handles legacy or corrupt files)
+                    try { file.readText() } catch (_: Exception) { "" }
+                }
             }
-        } else {
-            file.readText()
+            file.name.endsWith(".glh") -> {
+                try {
+                    val bytes = readFileBytes(file)
+                    if (bytes.isEmpty()) return@withContext ""
+                    GZIPInputStream(ByteArrayInputStream(bytes)).use {
+                        it.readAllBytes().toString(Charsets.UTF_8)
+                    }
+                } catch (_: Exception) {
+                    // Fallback: try plain text (e.g. .glhr saved without compression)
+                    try { file.readText() } catch (_: Exception) { "" }
+                }
+            }
+            else -> readFileBytes(file).toString(Charsets.UTF_8)
         }
     }
 
@@ -97,7 +176,7 @@ class StorageRepository(private val rootDirectory: File) {
     suspend fun saveWiki(relativePath: String, graph: WikiGraph) = withContext(Dispatchers.IO) {
         val file = File(rootDirectory, relativePath)
         file.parentFile?.mkdirs()
-        file.writeBytes(ProtoBuf.encodeToByteArray(graph))
+        writeAtomically(file, ProtoBuf.encodeToByteArray(graph))
     }
 
     /** Loads a WikiGraph from a .glw file. Returns null and deletes if schema is invalid. */

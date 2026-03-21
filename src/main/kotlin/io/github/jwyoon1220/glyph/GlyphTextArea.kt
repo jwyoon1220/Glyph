@@ -45,8 +45,12 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     private val typingStoppedListeners = mutableListOf<() -> Unit>()
     private var inactivityTimer: Timer? = null
 
-    /** Gemini AI completion client (optional; set by owner). */
-    var geminiClient: GeminiClient? = null
+    /** AI completion client (optional; set by owner). Supports Gemini, Groq, etc. */
+    var aiClient: AiClient? = null
+    @Deprecated("Use aiClient", ReplaceWith("aiClient"))
+    var geminiClient: AiClient?
+        get() = aiClient
+        set(value) { aiClient = value }
     private var ghostText = ""
     private var aiJob: kotlinx.coroutines.Job? = null
     private var aiSuggestionTimer: Timer? = null
@@ -91,7 +95,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             repaint()
         }
 
-        val client = geminiClient ?: return
+        val client = aiClient ?: return
         if (client.apiKey.isBlank()) return
 
         aiSuggestionTimer = Timer(AI_SUGGESTION_DELAY_MS) {
