@@ -28,7 +28,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     )
 
     private val rootPanel = JPanel(BorderLayout())
-    
+
     private val tabbedPane = JTabbedPane().apply {
         putClientProperty("JTabbedPane.tabClosable", true)
         putClientProperty("JTabbedPane.tabCloseCallback", java.util.function.BiConsumer<JTabbedPane, Int> { tabPane, tabIndex ->
@@ -38,13 +38,25 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         })
     }
     private val openEditors = mutableMapOf<String, Component>()
-    
+
     val activeFilePath: String
         get() {
             val comp = tabbedPane.selectedComponent ?: return ""
             return openEditors.entries.firstOrNull { it.value == comp }?.key ?: ""
         }
-    
+
+    // Status bar labels
+    private val branchLabel = JLabel().apply {
+        font = Font("SansSerif", Font.PLAIN, 12)
+        foreground = Color(130, 170, 255)
+        border = BorderFactory.createEmptyBorder(2, 8, 2, 8)
+    }
+    private val remoteLabel = JLabel().apply {
+        font = Font("SansSerif", Font.PLAIN, 12)
+        foreground = Color(169, 183, 198)
+        border = BorderFactory.createEmptyBorder(2, 8, 2, 8)
+    }
+
     // Coroutine Scope for UI
     private val uiScope = CoroutineScope(Dispatchers.Swing + Job())
 
@@ -57,10 +69,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         // Setup UI
         rootPanel.background = Color(1, 22, 39)
         jMenuBar = createMenuBar()
-        
+
         // Track recent project
         RecentProjectsManager.addProject(dataRoot)
-        
+
         // Build the tool-window layout via ToolWindowManager (interface-based injection)
         val toolWindowManager = ToolWindowManager(
             left   = object : ToolWindowPanel { override val component = createProjectToolWindow() },
@@ -69,15 +81,46 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             bottom = object : ToolWindowPanel { override val component = createVersionControlToolWindow() }
         )
         rootPanel.add(toolWindowManager.buildLayout(), BorderLayout.CENTER)
+        rootPanel.add(createStatusBar(), BorderLayout.SOUTH)
 
         WindowResizer(rootPanel)
         contentPane = rootPanel
 
         // Start the file watcher for real-time Lucene indexing
         fileWatcher.start()
-        
+
         // Open untitled by default
         openFile("Untitled.gle")
+
+        // Initial status bar refresh
+        refreshStatusBar()
+    }
+
+    private fun createStatusBar(): JPanel {
+        val bar = JPanel(BorderLayout())
+        bar.background = Color(30, 40, 55)
+        bar.border = BorderFactory.createMatteBorder(1, 0, 0, 0, Color(50, 60, 75))
+        bar.preferredSize = Dimension(0, 24)
+
+        val left = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0))
+        left.isOpaque = false
+        left.add(JLabel("  ⎇ ").apply { foreground = Color(100, 140, 100); font = Font("SansSerif", Font.PLAIN, 12) })
+        left.add(branchLabel)
+        left.add(JLabel("|").apply { foreground = Color(60, 70, 85); font = Font("SansSerif", Font.PLAIN, 12) })
+        left.add(remoteLabel)
+        bar.add(left, BorderLayout.WEST)
+        return bar
+    }
+
+    fun refreshStatusBar() {
+        uiScope.launch(Dispatchers.IO) {
+            val branch = gitManager.getCurrentBranch()
+            val remote = gitManager.getRemoteUrl()
+            withContext(Dispatchers.Swing) {
+                branchLabel.text = branch
+                remoteLabel.text = if (remote.isBlank()) "리모트 없음" else remote
+            }
+        }
     }
 
     private fun openFile(relPath: String) {
@@ -96,7 +139,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     repo.saveWiki(relPath, graph)
                     gitManager.commitAll("Initial Wiki mapping ($relPath)")
                 }
-                
+
                 withContext(Dispatchers.Swing) {
                     val editor = WikiGraphEditorComponent(graph) { changedGraph ->
                         uiScope.launch(Dispatchers.IO) {
@@ -108,7 +151,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                             gitManager.commitAll("Auto-save Wiki tree ($relPath)")
                         }
                     }
-                    
+
                     openEditors[relPath] = editor
                     tabbedPane.addTab(File(relPath).name, editor)
                     tabbedPane.selectedComponent = editor
@@ -133,7 +176,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     }
                 }
             }
-            
+
             val scrollEditor = JScrollPane(editor).apply {
                 border = BorderFactory.createEmptyBorder()
                 viewport.background = Color(1, 22, 39)
@@ -156,6 +199,27 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         }
     }
 
+    /** Reload every open text editor from disk (used after git rollback). */
+    private fun reloadAllEditors() {
+        for ((relPath, comp) in openEditors) {
+            val editor = findEditorInComponent(comp) ?: continue
+            uiScope.launch(Dispatchers.IO) {
+                val text = repo.loadFile(relPath)
+                withContext(Dispatchers.Swing) {
+                    editor.text = text
+                }
+            }
+        }
+    }
+
+    private fun findEditorInComponent(comp: Component): GlyphTextArea? {
+        if (comp is GlyphTextArea) return comp
+        if (comp is JScrollPane) {
+            val view = comp.viewport.view
+            if (view is GlyphTextArea) return view
+        }
+        return null
+    }
 
 
     // --- TOOL WINDOWS ---
@@ -234,23 +298,44 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         panel.border = BorderFactory.createTitledBorder(BorderFactory.createLineBorder(Color.DARK_GRAY), "Version Control")
         (panel.border as javax.swing.border.TitledBorder).titleColor = Color.LIGHT_GRAY
 
-        val gitLogComponent = io.github.jwyoon1220.glyph.vcs.GitLogComponent(gitManager)
-        
+        val gitLogComponent = io.github.jwyoon1220.glyph.vcs.GitLogComponent(gitManager) { commitHash ->
+            val confirm = JOptionPane.showConfirmDialog(
+                panel,
+                "이 커밋으로 롤백하시겠습니까?\n커밋 이후의 모든 변경 사항이 사라집니다.",
+                "롤백 확인", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE
+            )
+            if (confirm == JOptionPane.YES_OPTION) {
+                uiScope.launch(Dispatchers.IO) {
+                    val ok = gitManager.rollbackTo(commitHash)
+                    withContext(Dispatchers.Swing) {
+                        if (ok) {
+                            reloadAllEditors()
+                            gitLogComponent.refresh()
+                        } else {
+                            JOptionPane.showMessageDialog(
+                                panel, "롤백에 실패했습니다.", "오류", JOptionPane.ERROR_MESSAGE
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         val btnRefresh = JButton("Refresh Log")
         btnRefresh.addActionListener {
             gitLogComponent.refresh()
         }
-        
+
         val topBar = JPanel(FlowLayout(FlowLayout.LEFT))
         topBar.isOpaque = false
         topBar.add(btnRefresh)
 
         panel.add(topBar, BorderLayout.NORTH)
         panel.add(gitLogComponent, BorderLayout.CENTER)
-        
+
         // Initial refresh
         SwingUtilities.invokeLater { gitLogComponent.refresh() }
-        
+
         return panel
     }
 
@@ -258,7 +343,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         val menuBar = JMenuBar()
         val fileMenu = JMenu("파일(F)")
         fileMenu.mnemonic = KeyEvent.VK_F
-        
+
         val openItem = JMenuItem("열기(O)...", KeyEvent.VK_O)
         openItem.addActionListener {
             val chooser = FileChooser(this)
@@ -269,10 +354,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                 this.dispose()
             }
         }
-        
+
         val recentMenu = JMenu("최근 프로젝트 열기(R)")
         recentMenu.mnemonic = KeyEvent.VK_R
-        
+
         val recents = RecentProjectsManager.getRecentProjects()
         if (recents.isEmpty()) {
             val emptyItem = JMenuItem("최근 프로젝트 없음").apply { isEnabled = false }
@@ -294,23 +379,114 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                 recentMenu.add(item)
             }
         }
-        
+
         val exitItem = JMenuItem("종료(X)", KeyEvent.VK_X)
         exitItem.addActionListener { System.exit(0) }
-        
+
         fileMenu.add(openItem)
         fileMenu.add(recentMenu)
         fileMenu.addSeparator()
         fileMenu.add(exitItem)
-        
+
         menuBar.add(fileMenu)
+
+        // Git menu
+        val gitMenu = JMenu("Git")
+        gitMenu.mnemonic = KeyEvent.VK_G
+
+        val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
+
+        val remoteItem = JMenuItem("리모트 저장소 설정...")
+        remoteItem.addActionListener {
+            val current = gitManager.getRemoteUrl()
+            val url = JOptionPane.showInputDialog(
+                this, "GitHub 리모트 URL을 입력하세요:", "리모트 저장소 설정",
+                JOptionPane.PLAIN_MESSAGE, null, null, current
+            ) as? String ?: return@addActionListener
+            if (url.isNotBlank()) {
+                try {
+                    gitManager.setRemoteUrl(url.trim())
+                    refreshStatusBar()
+                    JOptionPane.showMessageDialog(this, "리모트 URL이 설정되었습니다.", "완료", JOptionPane.INFORMATION_MESSAGE)
+                } catch (ex: Exception) {
+                    JOptionPane.showMessageDialog(this, "오류: ${ex.message}", "오류", JOptionPane.ERROR_MESSAGE)
+                }
+            }
+        }
+
+        val credItem = JMenuItem("GitHub 인증 정보 설정...")
+        credItem.addActionListener {
+            val panel = JPanel(GridLayout(2, 2, 8, 4))
+            val userField = JTextField(prefs.get("git_username", ""), 20)
+            val tokenField = JPasswordField(prefs.get("git_token", ""), 20)
+            panel.add(JLabel("GitHub 사용자명:"))
+            panel.add(userField)
+            panel.add(JLabel("Personal Access Token:"))
+            panel.add(tokenField)
+            val result = JOptionPane.showConfirmDialog(
+                this, panel, "GitHub 인증 정보 설정", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE
+            )
+            if (result == JOptionPane.OK_OPTION) {
+                prefs.put("git_username", userField.text.trim())
+                prefs.put("git_token", String(tokenField.password).trim())
+            }
+        }
+
+        val pushItem = JMenuItem("Push")
+        pushItem.accelerator = KeyStroke.getKeyStroke(KeyEvent.VK_P, InputEvent.CTRL_DOWN_MASK or InputEvent.SHIFT_DOWN_MASK)
+        pushItem.addActionListener {
+            val username = prefs.get("git_username", "")
+            val token = prefs.get("git_token", "")
+            if (username.isBlank() || token.isBlank()) {
+                JOptionPane.showMessageDialog(this, "GitHub 인증 정보를 먼저 설정하세요.", "인증 필요", JOptionPane.WARNING_MESSAGE)
+                return@addActionListener
+            }
+            uiScope.launch(Dispatchers.IO) {
+                val err = gitManager.push(username, token)
+                withContext(Dispatchers.Swing) {
+                    if (err == null) {
+                        JOptionPane.showMessageDialog(this@GlyphMainFrame, "Push 완료!", "Git Push", JOptionPane.INFORMATION_MESSAGE)
+                    } else {
+                        JOptionPane.showMessageDialog(this@GlyphMainFrame, "Push 실패: $err", "오류", JOptionPane.ERROR_MESSAGE)
+                    }
+                }
+            }
+        }
+
+        val pullItem = JMenuItem("Pull")
+        pullItem.accelerator = KeyStroke.getKeyStroke(KeyEvent.VK_L, InputEvent.CTRL_DOWN_MASK or InputEvent.SHIFT_DOWN_MASK)
+        pullItem.addActionListener {
+            val username = prefs.get("git_username", "")
+            val token = prefs.get("git_token", "")
+            if (username.isBlank() || token.isBlank()) {
+                JOptionPane.showMessageDialog(this, "GitHub 인증 정보를 먼저 설정하세요.", "인증 필요", JOptionPane.WARNING_MESSAGE)
+                return@addActionListener
+            }
+            uiScope.launch(Dispatchers.IO) {
+                val err = gitManager.pull(username, token)
+                withContext(Dispatchers.Swing) {
+                    if (err == null) {
+                        reloadAllEditors()
+                        JOptionPane.showMessageDialog(this@GlyphMainFrame, "Pull 완료!", "Git Pull", JOptionPane.INFORMATION_MESSAGE)
+                    } else {
+                        JOptionPane.showMessageDialog(this@GlyphMainFrame, "Pull 실패: $err", "오류", JOptionPane.ERROR_MESSAGE)
+                    }
+                }
+            }
+        }
+
+        gitMenu.add(remoteItem)
+        gitMenu.add(credItem)
+        gitMenu.addSeparator()
+        gitMenu.add(pushItem)
+        gitMenu.add(pullItem)
+        menuBar.add(gitMenu)
 
         val settingsMenu = JMenu("설정(S)")
         settingsMenu.mnemonic = KeyEvent.VK_S
 
         val apiKeyItem = JMenuItem("Gemini API 키 설정...")
         apiKeyItem.addActionListener {
-            val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
             val currentKey = prefs.get("gemini_api_key", "")
             val result = JOptionPane.showInputDialog(
                 this,
@@ -335,22 +511,22 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
 
 fun main() {
     // Ultra High-Performance Hardware Acceleration using JNI to Native Window APIs
-    System.setProperty("sun.java2d.opengl", "true") 
+    System.setProperty("sun.java2d.opengl", "true")
     System.setProperty("sun.java2d.d3d", "true")
     System.setProperty("sun.java2d.noddraw", "false")
     System.setProperty("sun.java2d.accthreshold", "0")
-    
+
     System.setProperty("awt.useSystemAAFontSettings", "on")
     System.setProperty("swing.aatext", "true")
-    
+
     SwingUtilities.invokeLater {
         // Enable Hardware Accelerated Custom Native JNI window decorations
         FlatLaf.registerCustomDefaultsSource("io.github.jwyoon1220.glyph")
         System.setProperty("flatlaf.useWindowDecorations", "true")
         System.setProperty("flatlaf.menuBarEmbedded", "true")
-        
+
         FlatMaterialDesignDarkIJTheme.setup()
-        
+
         showProjectLauncher()
     }
 }
@@ -360,20 +536,20 @@ fun showProjectLauncher() {
     launcherFrame.setSize(500, 300)
     launcherFrame.setLocationRelativeTo(null)
     launcherFrame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
-    
+
     val panel = JPanel(GridBagLayout())
     panel.background = Color(1, 22, 39)
     panel.border = BorderFactory.createEmptyBorder(20, 20, 20, 20)
-    
+
     val titleLbl = JLabel("Welcome to Glyph")
     titleLbl.font = Font("SansSerif", Font.BOLD, 24)
     titleLbl.foreground = Color.WHITE
-    
+
     val gbc = GridBagConstraints()
     gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 2
     gbc.insets = Insets(0, 0, 30, 0)
     panel.add(titleLbl, gbc)
-    
+
     val btnCreate = JButton("Create New Project / Open Project Folder")
     btnCreate.font = Font("SansSerif", Font.PLAIN, 14)
     btnCreate.preferredSize = Dimension(300, 40)
@@ -383,16 +559,16 @@ fun showProjectLauncher() {
         if (chooser.selectedFile != null) {
             val projectDir = chooser.selectedFile!!
             launcherFrame.dispose()
-            
+
             val frame = GlyphMainFrame(projectDir)
             frame.isVisible = true
         }
     }
-    
+
     gbc.gridy = 1
     gbc.insets = Insets(10, 0, 10, 0)
     panel.add(btnCreate, gbc)
-    
+
     val recents = RecentProjectsManager.getRecentProjects()
     if (recents.isNotEmpty()) {
         val recentPanel = JPanel(GridLayout(0, 1, 0, 5))
@@ -400,7 +576,7 @@ fun showProjectLauncher() {
         val recentLbl = JLabel("Recent Projects")
         recentLbl.foreground = Color.GRAY
         recentPanel.add(recentLbl)
-        
+
         for (path in recents.take(3)) {
             val file = File(path)
             val btn = JButton(file.name).apply {
@@ -427,7 +603,7 @@ fun showProjectLauncher() {
         gbc.insets = Insets(20, 0, 0, 0)
         panel.add(recentPanel, gbc)
     }
-    
+
     launcherFrame.contentPane = panel
     launcherFrame.rootPane.putClientProperty("JRootPane.titleBarBackground", Color(1, 22, 39))
     launcherFrame.isVisible = true
