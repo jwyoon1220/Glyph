@@ -6,19 +6,44 @@ import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.decodeFromByteArray
 import kotlinx.serialization.encodeToByteArray
 import kotlinx.serialization.protobuf.ProtoBuf
+import kotlinx.serialization.Serializable
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
 
+@Serializable
+data class EpisodeData(
+    val title: String,
+    val content: String
+)
+
 class StorageRepository(private val rootDirectory: File) {
 
-    init {
-        if (!rootDirectory.exists()) {
-            rootDirectory.mkdirs()
+    companion object {
+        private const val SMALL_FILE_THRESHOLD = 2 * 1024 * 1024L // 2 MB
+
+        /** Reads a file: BufferedInputStream for ≤2MB, mmap for larger. */
+        fun readFileBytes(file: File): ByteArray {
+            return if (file.length() <= SMALL_FILE_THRESHOLD) {
+                BufferedInputStream(file.inputStream()).use { it.readAllBytes() }
+            } else {
+                RandomAccessFile(file, "r").use { raf ->
+                    raf.channel.use { channel ->
+                        val buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
+                        ByteArray(buf.remaining()).also { buf.get(it) }
+                    }
+                }
+            }
         }
     }
 
+    init {
+        if (!rootDirectory.exists()) rootDirectory.mkdirs()
+    }
+
     private val settingsFile = File(rootDirectory, "project_metadata.glb")
+    @Suppress("unused")
     private val chaptersDir = File(rootDirectory, "chapters").apply { mkdirs() }
 
     @OptIn(ExperimentalSerializationApi::class)
@@ -27,39 +52,67 @@ class StorageRepository(private val rootDirectory: File) {
         settingsFile.writeBytes(bytes)
     }
 
-    /**
-     * Loads project settings from the .glb binary file using a memory-mapped NIO FileChannel
-     * to minimise parsing overhead for large settings files.
-     */
     @OptIn(ExperimentalSerializationApi::class)
     suspend fun loadSettings(): ProjectSettings = withContext(Dispatchers.IO) {
-        if (!settingsFile.exists()) {
-            return@withContext ProjectSettings("Untitled Project")
-        }
-        val bytes = RandomAccessFile(settingsFile, "r").use { raf ->
-            raf.channel.use { channel ->
-                val mappedBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
-                ByteArray(mappedBuffer.remaining()).also { mappedBuffer.get(it) }
-            }
-        }
+        if (!settingsFile.exists()) return@withContext ProjectSettings("Untitled Project")
+        val bytes = readFileBytes(settingsFile)
         ProtoBuf.decodeFromByteArray<ProjectSettings>(bytes)
     }
 
-    /** Saves a chapter as a Markdown (.md) file. */
-    suspend fun saveChapter(chapterId: String, content: String) = withContext(Dispatchers.IO) {
-        val file = File(chaptersDir, "$chapterId.md")
-        file.writeText(content)
+    /** Saves content to an arbitrary file within rootDirectory. */
+    @OptIn(ExperimentalSerializationApi::class)
+    suspend fun saveFile(relativePath: String, content: String) = withContext(Dispatchers.IO) {
+        val file = File(rootDirectory, relativePath)
+        file.parentFile?.mkdirs()
+        if (file.name.endsWith(".gle")) {
+            val episode = EpisodeData(file.nameWithoutExtension, content)
+            file.writeBytes(ProtoBuf.encodeToByteArray(episode))
+        } else {
+            file.writeText(content)
+        }
     }
 
-    /** Loads a chapter from its Markdown (.md) file. */
-    suspend fun loadChapter(chapterId: String): String = withContext(Dispatchers.IO) {
-        val file = File(chaptersDir, "$chapterId.md")
-        if (file.exists()) file.readText() else ""
+    /** Loads content from an arbitrary file within rootDirectory. */
+    @OptIn(ExperimentalSerializationApi::class)
+    suspend fun loadFile(relativePath: String): String = withContext(Dispatchers.IO) {
+        val file = File(rootDirectory, relativePath)
+        if (!file.exists()) return@withContext ""
+        if (file.name.endsWith(".gle")) {
+            try {
+                val bytes = readFileBytes(file)
+                if (bytes.isEmpty()) return@withContext ""
+                val episode = ProtoBuf.decodeFromByteArray<EpisodeData>(bytes)
+                episode.content
+            } catch (e: Exception) {
+                e.printStackTrace()
+                ""
+            }
+        } else {
+            file.readText()
+        }
     }
 
-    suspend fun listChapters(): List<String> = withContext(Dispatchers.IO) {
-        chaptersDir.listFiles { _, name -> name.endsWith(".md") }
-            ?.map { it.nameWithoutExtension }
-            ?: emptyList()
+    /** Saves a WikiGraph to a .glw file using Protobuf. */
+    @OptIn(ExperimentalSerializationApi::class)
+    suspend fun saveWiki(relativePath: String, graph: WikiGraph) = withContext(Dispatchers.IO) {
+        val file = File(rootDirectory, relativePath)
+        file.parentFile?.mkdirs()
+        file.writeBytes(ProtoBuf.encodeToByteArray(graph))
+    }
+
+    /** Loads a WikiGraph from a .glw file. Returns null and deletes if schema is invalid. */
+    @OptIn(ExperimentalSerializationApi::class)
+    suspend fun loadWiki(relativePath: String): WikiGraph? = withContext(Dispatchers.IO) {
+        val file = File(rootDirectory, relativePath)
+        if (!file.exists()) return@withContext null
+        try {
+            val bytes = readFileBytes(file)
+            if (bytes.isEmpty()) return@withContext null
+            ProtoBuf.decodeFromByteArray<WikiGraph>(bytes)
+        } catch (e: Exception) {
+            System.err.println("[loadWiki] Schema mismatch for '$relativePath', resetting: ${e.message}")
+            file.delete()
+            null
+        }
     }
 }

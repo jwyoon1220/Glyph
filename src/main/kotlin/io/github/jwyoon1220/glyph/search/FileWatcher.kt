@@ -72,7 +72,8 @@ class FileWatcher(
 
     private suspend fun indexFile(file: File) {
         when {
-            file.name.endsWith(".md") -> {
+            file.name.endsWith(".md") || file.name.endsWith(".gle") 
+                    || file.name.endsWith(".glp") || file.name.endsWith(".glw") -> {
                 if (file.canRead()) {
                     val content = withContext(Dispatchers.IO) { file.readText() }
                     luceneSearcher.indexDocument(file.nameWithoutExtension, content)
