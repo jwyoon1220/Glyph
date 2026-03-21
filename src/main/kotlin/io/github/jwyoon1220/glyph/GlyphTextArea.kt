@@ -20,6 +20,11 @@ import javax.swing.border.LineBorder
 
 class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Scrollable {
 
+    private companion object {
+        const val AI_SUGGESTION_DELAY_MS = 2000
+        val GHOST_TEXT_COLOR = Color(128, 128, 128)
+    }
+
     private val pieceTable = PieceTable()
     private val uiScope = CoroutineScope(Dispatchers.Swing + Job())
 
@@ -39,6 +44,12 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     /** Listeners notified after a period of typing inactivity (for auto-commit). */
     private val typingStoppedListeners = mutableListOf<() -> Unit>()
     private var inactivityTimer: Timer? = null
+
+    /** Gemini AI completion client (optional; set by owner). */
+    var geminiClient: GeminiClient? = null
+    private var ghostText = ""
+    private var aiJob: kotlinx.coroutines.Job? = null
+    private var aiSuggestionTimer: Timer? = null
 
     /** Optional undo handler supplied by the owner (e.g. git-based restore). */
     var onUndoRequested: (() -> Unit)? = null
@@ -67,6 +78,47 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         }.also {
             it.isRepeats = false
             it.start()
+        }
+        resetAiSuggestionTimer()
+    }
+
+    private fun resetAiSuggestionTimer() {
+        aiSuggestionTimer?.stop()
+        aiJob?.cancel()
+        aiJob = null
+        if (ghostText.isNotEmpty()) {
+            ghostText = ""
+            repaint()
+        }
+
+        val client = geminiClient ?: return
+        if (client.apiKey.isBlank()) return
+
+        aiSuggestionTimer = Timer(AI_SUGGESTION_DELAY_MS) {
+            if (caretOffset < pieceTable.length || compositionText.isNotEmpty()) return@Timer
+            val currentText = pieceTable.getText(0, pieceTable.length)
+            if (currentText.isBlank()) return@Timer
+
+            aiJob = uiScope.launch {
+                val suggestion = client.getSuggestion(currentText)
+                if (isActive && suggestion.isNotBlank() && ghostText.isEmpty()) {
+                    ghostText = suggestion
+                    repaint()
+                }
+            }
+        }.also {
+            it.isRepeats = false
+            it.start()
+        }
+    }
+
+    private fun clearGhostText() {
+        aiSuggestionTimer?.stop()
+        aiJob?.cancel()
+        aiJob = null
+        if (ghostText.isNotEmpty()) {
+            ghostText = ""
+            repaint()
         }
     }
 
@@ -136,6 +188,36 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 val shift = e.isShiftDown
                 val ctrl = e.isControlDown || e.isMetaDown
 
+                // Tab: accept AI ghost-text suggestion (or do nothing)
+                if (e.keyCode == KeyEvent.VK_TAB) {
+                    e.consume()
+                    if (ghostText.isNotEmpty()) {
+                        if (hasActiveSelection()) deleteSelection()
+                        pieceTable.insert(caretOffset, ghostText)
+                        caretOffset += ghostText.length
+                        ghostText = ""
+                        clearSelection()
+                        resetInactivityTimer()
+                        showCaret = true
+                        repaint()
+                    }
+                    return
+                }
+
+                // Escape: dismiss AI suggestion
+                if (e.keyCode == KeyEvent.VK_ESCAPE && ghostText.isNotEmpty()) {
+                    clearGhostText()
+                    return
+                }
+
+                // Any other key press dismisses the ghost text
+                if (ghostText.isNotEmpty()) {
+                    aiSuggestionTimer?.stop()
+                    aiJob?.cancel()
+                    aiJob = null
+                    ghostText = ""
+                }
+
                 if (shift && selectionStart == -1) {
                     selectionStart = caretOffset
                     selectionEnd = caretOffset
@@ -201,11 +283,23 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             override fun mousePressed(e: MouseEvent) {
                 requestFocusInWindow()
                 popupWindow?.isVisible = false
+                clearGhostText()
+
+                if (e.isPopupTrigger) {
+                    showContextMenu(e.x, e.y)
+                    return
+                }
 
                 val offset = getOffsetFromPoint(e.x, e.y)
                 caretOffset = offset
                 clearSelection()
                 repaint()
+            }
+
+            override fun mouseReleased(e: MouseEvent) {
+                if (e.isPopupTrigger) {
+                    showContextMenu(e.x, e.y)
+                }
             }
         })
         
@@ -388,10 +482,61 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         }
     }
 
+    private fun showContextMenu(x: Int, y: Int) {
+        popupWindow?.isVisible = false
+        val hasSelection = hasActiveSelection()
+        val hasClipboard = try {
+            val cb = Toolkit.getDefaultToolkit().systemClipboard.getContents(null)
+            cb?.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.stringFlavor) == true
+        } catch (ex: Exception) { false }
+
+        val menu = JPopupMenu()
+
+        val cutItem = JMenuItem("잘라내기").apply {
+            isEnabled = hasSelection
+            addActionListener {
+                copyToClipboard()
+                deleteSelection()
+                repaint()
+            }
+        }
+
+        val copyItem = JMenuItem("복사").apply {
+            isEnabled = hasSelection
+            addActionListener { copyToClipboard() }
+        }
+
+        val pasteItem = JMenuItem("붙여넣기").apply {
+            isEnabled = hasClipboard
+            addActionListener {
+                pasteFromClipboard()
+                repaint()
+            }
+        }
+
+        val selectAllItem = JMenuItem("전체 선택").apply {
+            addActionListener {
+                selectionStart = 0
+                selectionEnd = pieceTable.length
+                caretOffset = pieceTable.length
+                repaint()
+            }
+        }
+
+        menu.add(cutItem)
+        menu.add(copyItem)
+        menu.add(pasteItem)
+        menu.addSeparator()
+        menu.add(selectAllItem)
+        menu.show(this, x, y)
+    }
+
     private fun clearSelection() {
         selectionStart = -1
         selectionEnd = -1
     }
+
+    private fun hasActiveSelection() = selectionStart != -1 && selectionStart != selectionEnd
 
     private fun deleteSelection() {
         if (selectionStart == -1 || selectionStart == selectionEnd) return
@@ -662,6 +807,20 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             g2d.color = Color(247, 140, 108) // Night Owl Caret
             val cx = caretX + (if (compositionText.isNotEmpty()) fm.stringWidth(compositionText) else 0)
             g2d.fillRect(cx, caretY, 1, lineHeight)
+        }
+
+        // Draw AI ghost-text suggestion (IntelliJ-style, gray, only at end of document)
+        if (ghostText.isNotEmpty() && hasFocus() && foundCaret &&
+            caretOffset == pieceTable.length && compositionText.isEmpty()
+        ) {
+            g2d.color = GHOST_TEXT_COLOR
+            val ghostStartX = caretX
+            val ghostLines = ghostText.split('\n')
+            for (gi in ghostLines.indices) {
+                val gx = if (gi == 0) ghostStartX else 0
+                val gy = caretY + gi * lineHeight + ascent
+                g2d.drawString(ghostLines[gi], gx, gy)
+            }
         }
 
         // Auto-scroll after paint to ensure layout is ready

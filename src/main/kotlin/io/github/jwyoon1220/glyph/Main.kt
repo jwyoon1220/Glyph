@@ -22,6 +22,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     private val dictClient = DictionaryClient()
     private val luceneSearcher = LuceneSearcher()
     private val fileWatcher = FileWatcher(dataRoot, luceneSearcher, repo)
+    private val geminiClient = GeminiClient(
+        java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
+            .get("gemini_api_key", "")
+    )
 
     private val rootPanel = JPanel(BorderLayout())
     
@@ -112,6 +116,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             }
         } else {
             val editor = GlyphTextArea(dictClient)
+            editor.geminiClient = geminiClient
             editor.addTypingStoppedListener {
                 uiScope.launch(Dispatchers.IO) {
                     repo.saveFile(relPath, editor.text)
@@ -299,6 +304,31 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         fileMenu.add(exitItem)
         
         menuBar.add(fileMenu)
+
+        val settingsMenu = JMenu("설정(S)")
+        settingsMenu.mnemonic = KeyEvent.VK_S
+
+        val apiKeyItem = JMenuItem("Gemini API 키 설정...")
+        apiKeyItem.addActionListener {
+            val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
+            val currentKey = prefs.get("gemini_api_key", "")
+            val result = JOptionPane.showInputDialog(
+                this,
+                "Gemini API 키를 입력하세요:",
+                "AI 설정",
+                JOptionPane.PLAIN_MESSAGE,
+                null,
+                null,
+                currentKey
+            ) as? String
+            if (result != null) {
+                prefs.put("gemini_api_key", result)
+                geminiClient.apiKey = result
+            }
+        }
+        settingsMenu.add(apiKeyItem)
+        menuBar.add(settingsMenu)
+
         return menuBar
     }
 }
