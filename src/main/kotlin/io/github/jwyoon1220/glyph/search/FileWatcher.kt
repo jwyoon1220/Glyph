@@ -72,16 +72,21 @@ class FileWatcher(
 
     private suspend fun indexFile(file: File) {
         when {
-            file.name.endsWith(".md") || file.name.endsWith(".gle") 
-                    || file.name.endsWith(".glp") || file.name.endsWith(".glw") -> {
+            file.name.endsWith(".md") || file.name.endsWith(".gle")
+                    || file.name.endsWith(".glp") || file.name.endsWith(".glw")
+                    || file.name.endsWith(".glhr") -> {
                 if (file.canRead()) {
                     val content = withContext(Dispatchers.IO) { file.readText() }
                     luceneSearcher.indexDocument(file.nameWithoutExtension, content)
                 }
             }
+            file.name.endsWith(".glh") -> {
+                // .glh is gzip-compressed markdown — read via StorageRepository
+                val relPath = file.relativeTo(watchRoot).path.replace('\\', '/')
+                val content = storageRepository.loadFile(relPath)
+                if (content.isNotEmpty()) luceneSearcher.indexDocument(file.nameWithoutExtension, content)
+            }
             file.name.endsWith(".glb") -> {
-                // Index metadata from .glb: use file name as identifier.
-                // Full deserialization is done by StorageRepository on demand.
                 luceneSearcher.indexDocument(file.nameWithoutExtension, file.name)
             }
         }

@@ -1,22 +1,35 @@
 package io.github.jwyoon1220.glyph
 
-import java.util.ArrayList
-
 /**
- * A highly un-optimized PieceTable for storing and editing text efficiently.
- * The Piece Table maintains an Original Buffer (read-only) and an Add Buffer (append-only).
- * It uses a list of Pieces (spans of text) pointing to either of these buffers.
+ * Optimized PieceTable for storing and editing text.
+ *
+ * Performance improvements over the naïve implementation:
+ *  - Prefix-sum offset cache (lazily built, O(n) to build, O(log n) to look up a
+ *    piece by character offset via binary search — covers getText, insert, delete).
+ *  - Adjacent-piece coalescing: when inserting text that immediately extends the
+ *    last piece in the ADD buffer we just grow that piece rather than adding a new
+ *    one, keeping the piece list short and the binary search fast.
+ *  - CharArray add-buffer: direct char[] access avoids StringBuilder range-check
+ *    overhead on hot getText paths.
+ *  - Early-exit in getText: stops iterating once the requested range is satisfied.
  */
 class PieceTable(initialText: String = "") {
-    private val originalBuffer = initialText
-    private val addBuffer = StringBuilder()
+    private val originalBuffer: CharArray = initialText.toCharArray()
+    // Grow-doubling add buffer — written append-only, never mutated.
+    private var addBuffer: CharArray = CharArray(maxOf(64, initialText.length * 2))
+    private var addLength = 0
 
     enum class BufferType { ORIGINAL, ADD }
 
     data class Piece(val source: BufferType, val offset: Int, var length: Int)
 
-    private val pieces = ArrayList<Piece>()
+    private val pieces = ArrayList<Piece>(16)
     private var totalLength = initialText.length
+
+    // --- Offset cache (prefix sums) ---
+    // offsetCache[i] = character offset of the *start* of pieces[i].
+    // null means dirty and must be rebuilt before use.
+    private var offsetCache: IntArray? = null
 
     init {
         if (initialText.isNotEmpty()) {
@@ -24,143 +37,208 @@ class PieceTable(initialText: String = "") {
         }
     }
 
-    /**
-     * Inserts text at the given index.
-     */
+    // ------------------------------------------------------------------ cache
+
+    private fun invalidateCache() { offsetCache = null }
+
+    /** Returns (and caches) the prefix-sum offset array. O(n) on first call after
+     *  any mutation, O(1) on subsequent reads until the next mutation. */
+    private fun cache(): IntArray {
+        offsetCache?.let { return it }
+        val c = IntArray(pieces.size + 1) // c[i] = start of pieces[i]; c[size] = totalLength
+        var pos = 0
+        for (i in pieces.indices) {
+            c[i] = pos
+            pos += pieces[i].length
+        }
+        c[pieces.size] = pos
+        return c.also { offsetCache = it }
+    }
+
+    /** Binary-search: returns the index of the piece that *contains* [offset].
+     *  Returns pieces.size if offset == totalLength (i.e. appending at end). */
+    private fun pieceIndexAt(offset: Int): Int {
+        val c = cache()
+        var lo = 0; var hi = pieces.size - 1
+        while (lo <= hi) {
+            val mid = (lo + hi).ushr(1)
+            when {
+                c[mid + 1] <= offset -> lo = mid + 1
+                c[mid]     >  offset -> hi = mid - 1
+                else -> return mid
+            }
+        }
+        return pieces.size // at the very end
+    }
+
+    // -------------------------------------------------------------- add buffer
+
+    private fun appendToAddBuffer(text: String): Int {
+        val needed = addLength + text.length
+        if (needed > addBuffer.size) {
+            addBuffer = addBuffer.copyOf(maxOf(needed, addBuffer.size * 2))
+        }
+        val start = addLength
+        text.toCharArray(addBuffer, start)
+        addLength += text.length
+        return start
+    }
+
+    // ----------------------------------------------------------------- insert
+
     fun insert(index: Int, text: String) {
-        if (index !in 0..totalLength) throw IndexOutOfBoundsException()
+        if (index !in 0..totalLength) throw IndexOutOfBoundsException("index=$index, length=$totalLength")
         if (text.isEmpty()) return
 
-        val addOffset = addBuffer.length
-        addBuffer.append(text)
-        val newPiece = Piece(BufferType.ADD, addOffset, text.length)
+        val addOffset = appendToAddBuffer(text)
         totalLength += text.length
+
+        // Fast path: coalesce with the last piece when appending at document end.
+        // At this point totalLength already includes text.length, so
+        // (totalLength - text.length) == the pre-insert total == the required insert index.
+        if (index == totalLength - text.length && pieces.isNotEmpty()) {
+            val last = pieces.last()
+            if (last.source == BufferType.ADD && last.offset + last.length == addOffset) {
+                last.length += text.length
+                invalidateCache()
+                return
+            }
+        }
+
+        val newPiece = Piece(BufferType.ADD, addOffset, text.length)
 
         if (index == 0) {
             pieces.add(0, newPiece)
+            invalidateCache()
             return
         }
 
-        var currentPos = 0
-        for (i in pieces.indices) {
-            val p = pieces[i]
-            if (currentPos + p.length > index) {
-                // Split the piece
-                val splitIndex = index - currentPos
-                val rightLength = p.length - splitIndex
-                p.length = splitIndex
-                
-                val rightPiece = Piece(p.source, p.offset + splitIndex, rightLength)
-                pieces.add(i + 1, newPiece)
-                pieces.add(i + 2, rightPiece)
-                return
-            }
-            currentPos += p.length
+        val c = cache()
+        val i = pieceIndexAt(index)
+
+        if (i == pieces.size) {
+            // After all pieces — append
+            pieces.add(newPiece)
+            invalidateCache()
+            return
         }
-        pieces.add(newPiece) // Append to end
+
+        val p = pieces[i]
+        val splitIndex = index - c[i]
+
+        if (splitIndex == 0) {
+            // Insert before piece i
+            pieces.add(i, newPiece)
+        } else {
+            // Split piece i at splitIndex
+            val rightPiece = Piece(p.source, p.offset + splitIndex, p.length - splitIndex)
+            p.length = splitIndex
+            pieces.add(i + 1, newPiece)
+            pieces.add(i + 2, rightPiece)
+        }
+        invalidateCache()
     }
 
-    /**
-     * Deletes a given number of characters from the index.
-     */
+    // ----------------------------------------------------------------- delete
+
     fun delete(index: Int, length: Int) {
         if (index < 0 || length < 0 || index + length > totalLength) throw IndexOutOfBoundsException()
         if (length == 0) return
 
         totalLength -= length
         val deletionEnd = index + length
-        var currentPos = 0
 
-        var i = 0
-        while (i < pieces.size) {
+        // Capture piece start offsets *before* mutating so we can iterate correctly.
+        val c = cache()
+        // Find the first piece that overlaps the deletion range.
+        var i = pieceIndexAt(index)
+        // pStart tracks the character-offset of pieces[i] as we iterate.
+        // We derive it from the (pre-mutation) cache.
+        var pStart = if (i < pieces.size) c[i] else totalLength + length
+
+        invalidateCache()
+
+        while (i < pieces.size && pStart < deletionEnd) {
             val p = pieces[i]
-            val originalLength = p.length
-            val pStart = currentPos
-            val pEnd = currentPos + originalLength
+            val pEnd = pStart + p.length
 
-            if (pEnd > index && pStart < deletionEnd) {
-                val overlapStart = maxOf(0, index - pStart)
-                val overlapEnd = minOf(originalLength, deletionEnd - pStart)
+            if (pEnd <= index) { pStart = pEnd; i++; continue } // before deletion range
 
-                // If whole piece is deleted
-                if (overlapStart == 0 && overlapEnd == originalLength) {
+            val overlapStart = (index - pStart).coerceAtLeast(0)
+            val overlapEnd   = (deletionEnd - pStart).coerceAtMost(p.length)
+            val deleteCount  = overlapEnd - overlapStart
+            if (deleteCount <= 0) { pStart = pEnd; i++; continue }
+
+            when {
+                overlapStart == 0 && overlapEnd == p.length -> {
+                    // Entire piece consumed
                     pieces.removeAt(i)
-                    currentPos += originalLength
-                    if (currentPos >= deletionEnd) break
-                    continue
+                    pStart = pEnd // pStart for next piece (which is now at index i)
+                    // Don't advance i — the piece at i is now what was i+1
                 }
-                // If right part is deleted
-                else if (overlapEnd == originalLength) {
+                overlapStart == 0 -> {
+                    pieces[i] = Piece(p.source, p.offset + overlapEnd, p.length - overlapEnd)
+                    pStart = pEnd; i++
+                }
+                overlapEnd == p.length -> {
                     p.length = overlapStart
-                } 
-                // If left part is deleted
-                else if (overlapStart == 0) {
-                    pieces[i] = Piece(p.source, p.offset + overlapEnd, originalLength - overlapEnd)
-                } 
-                // Middle part is deleted (requires to be split)
-                else {
-                    val rightPiece = Piece(p.source, p.offset + overlapEnd, originalLength - overlapEnd)
+                    pStart = pEnd; i++
+                }
+                else -> {
+                    // Middle deletion — split
+                    val right = Piece(p.source, p.offset + overlapEnd, p.length - overlapEnd)
                     p.length = overlapStart
-                    pieces.add(i + 1, rightPiece)
-                    i++ // Skip the newly added piece
+                    pieces.add(i + 1, right)
+                    pStart = pEnd; i += 2
                 }
             }
-            currentPos += originalLength
-            if (currentPos >= deletionEnd) break
-            i++
         }
     }
 
+    // ----------------------------------------------------------------- getText
+
     /**
-     * 지정된 범위(start ~ end)의 텍스트만 효율적으로 추출합니다.
-     * @param start 시작 인덱스 (inclusive)
-     * @param end 끝 인덱스 (exclusive)
+     * Efficiently extracts text in [start, end).
+     * Uses the offset cache to binary-search the start piece, then
+     * iterates forward until [end] is reached.
      */
     fun getText(start: Int, end: Int): String {
-        if (start < 0 || end > totalLength || start >= end) return ""
+        if (start >= end || start < 0 || end > totalLength) return ""
 
+        val startPiece = pieceIndexAt(start) // also warms the cache
+        val c = cache()
         val builder = StringBuilder(end - start)
-        var currentPos = 0
 
-        for (p in pieces) {
-            val pieceStart = currentPos
-            val pieceEnd = currentPos + p.length
+        var i = startPiece
+        var remaining = end - start
+        var pieceOff = start - c[startPiece] // offset within the first piece
 
-            // 1. 현재 조각이 요청 범위에 포함되는지 확인
-            if (pieceEnd > start) {
-                // 2. 조각 내에서 실제로 가져올 시작/끝 오프셋 계산
-                val relativeStart = maxOf(0, start - pieceStart)
-                val relativeEnd = minOf(p.length, end - pieceStart)
-
-                val buffer = if (p.source == BufferType.ORIGINAL) originalBuffer else addBuffer
-
-                // 3. 해당 조각의 필요한 부분만 append
-                builder.append(
-                    buffer,
-                    p.offset + relativeStart,
-                    p.offset + relativeEnd
-                )
-            }
-
-            currentPos = pieceEnd
-
-            // 4. 이미 범위를 벗어났다면 루프 조기 종료 (성능 최적화)
-            if (currentPos >= end) break
+        while (i < pieces.size && remaining > 0) {
+            val p = pieces[i]
+            val available = p.length - pieceOff
+            val take = minOf(available, remaining)
+            val buf = if (p.source == BufferType.ORIGINAL) originalBuffer else addBuffer
+            builder.append(buf, p.offset + pieceOff, p.offset + pieceOff + take)
+            remaining -= take
+            pieceOff = 0
+            i++
         }
 
         return builder.toString()
     }
 
-    val length: Int
-        get() = totalLength
+    // --------------------------------------------------------------- setText
 
     fun setText(newText: String) {
         pieces.clear()
-        addBuffer.clear()
-        addBuffer.append(newText)
+        addLength = 0
         totalLength = newText.length
+        invalidateCache()
         if (newText.isNotEmpty()) {
+            appendToAddBuffer(newText)
             pieces.add(Piece(BufferType.ADD, 0, newText.length))
         }
     }
+
+    val length: Int get() = totalLength
 }

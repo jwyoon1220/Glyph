@@ -82,9 +82,12 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         addWindowListener(object : java.awt.event.WindowAdapter() {
             override fun windowClosing(e: java.awt.event.WindowEvent) {
                 saveRecoveryData()
+                luceneSearcher.close()
                 dispose()
-                // Exit only if this is the last window
-                if (JFrame.getFrames().none { it.isVisible }) System.exit(0)
+                // Use displayable check so minimized sibling windows don't block exit
+                if (JFrame.getFrames().none { it.isDisplayable && it != this@GlyphMainFrame }) {
+                    System.exit(0)
+                }
             }
         })
 
@@ -179,6 +182,28 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     tabbedPane.selectedComponent = editor
                 }
             }
+        } else if (relPath.endsWith(".md") || relPath.endsWith(".glh") || relPath.endsWith(".glhr")) {
+            val mdEditor = MarkdownEditorComponent()
+            mdEditor.onTypingStopped = {
+                prefs.remove("recovery_${relPath.hashCode()}")
+                uiScope.launch(Dispatchers.IO) {
+                    repo.saveFile(relPath, mdEditor.text)
+                    gitManager.commitAll("Auto-save ($relPath)")
+                }
+            }
+            openEditors[relPath] = mdEditor
+            tabbedPane.addTab(File(relPath).name, mdEditor)
+            tabbedPane.selectedComponent = mdEditor
+
+            uiScope.launch(Dispatchers.IO) {
+                val fileExists = File(dataRoot, relPath).exists()
+                if (!fileExists) {
+                    repo.saveFile(relPath, "")
+                    gitManager.commitAll("Initial commit ($relPath)")
+                }
+                val text = repo.loadFile(relPath)
+                withContext(Dispatchers.Swing) { mdEditor.text = text }
+            }
         } else {
             val editor = GlyphTextArea(dictClient)
             editor.aiClient = activeAiClient
@@ -242,8 +267,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     /** Save all open editor contents to Preferences for crash recovery. */
     fun saveRecoveryData() {
         for ((relPath, comp) in openEditors) {
-            val editor = findEditorInComponent(comp) ?: continue
-            val text = editor.text
+            val text = getEditorText(comp) ?: continue
             if (text.isNotEmpty()) {
                 prefs.put("recovery_${relPath.hashCode()}", text)
             }
@@ -253,11 +277,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     /** Reload every open text editor from disk (used after git rollback). */
     private fun reloadAllEditors() {
         for ((relPath, comp) in openEditors) {
-            val editor = findEditorInComponent(comp) ?: continue
             uiScope.launch(Dispatchers.IO) {
                 val text = repo.loadFile(relPath)
                 withContext(Dispatchers.Swing) {
-                    editor.text = text
+                    setEditorText(comp, text)
                 }
             }
         }
@@ -270,6 +293,21 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             if (view is GlyphTextArea) return view
         }
         return null
+    }
+
+    /** Returns the text content of any editor component we know about. */
+    private fun getEditorText(comp: Component): String? =
+        when {
+            comp is MarkdownEditorComponent -> comp.text
+            else -> findEditorInComponent(comp)?.text
+        }
+
+    /** Sets the text content of any editor component we know about. */
+    private fun setEditorText(comp: Component, text: String) {
+        when {
+            comp is MarkdownEditorComponent -> comp.text = text
+            else -> findEditorInComponent(comp)?.text = text
+        }
     }
 
 

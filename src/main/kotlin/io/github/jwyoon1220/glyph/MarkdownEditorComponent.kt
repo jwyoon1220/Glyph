@@ -88,7 +88,6 @@ class MarkdownEditorComponent : JPanel(BorderLayout()) {
               th { background:#1d3b53; }
             </style></head><body>$html</body></html>
         """.trimIndent()
-        val pos = preview.document.getProperty("i18n") // keep scroll pos trick
         preview.text = styled
         preview.caretPosition = 0
     }
