@@ -138,6 +138,33 @@ class ProjectExplorerComponent(
         scrollPane.viewport.background = Color(1, 22, 39)
         add(scrollPane, BorderLayout.CENTER)
 
+        // Keyboard shortcuts: Delete = delete selected, F2 = rename
+        tree.addKeyListener(object : KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                when (e.keyCode) {
+                    KeyEvent.VK_DELETE -> {
+                        val file = getSelectedFile() ?: return
+                        if (file == rootDir) return
+                        val confirm = JOptionPane.showConfirmDialog(
+                            this@ProjectExplorerComponent,
+                            "\"${file.name}\"을(를) 삭제할까요?",
+                            "삭제 확인", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE
+                        )
+                        if (confirm == JOptionPane.YES_OPTION) {
+                            file.deleteRecursively()
+                            refreshTree()
+                        }
+                    }
+                    KeyEvent.VK_F2 -> {
+                        val path = tree.selectionPath ?: return
+                        val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
+                        val file = node.userObject as? File ?: return
+                        if (file != rootDir) tree.startEditingAtPath(path)
+                    }
+                }
+            }
+        })
+
         refreshTree()
     }
 
