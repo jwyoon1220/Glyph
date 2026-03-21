@@ -15,7 +15,9 @@ package io.github.jwyoon1220.glyph
  */
 class PieceTable(initialText: String = "") {
     private val originalBuffer: CharArray = initialText.toCharArray()
-    // Grow-doubling add buffer — written append-only, never mutated.
+    // Grow-doubling add buffer — individual elements are written once and never
+    // changed; the array reference is replaced (grown) in appendToAddBuffer and
+    // reset to a fresh allocation in setText.
     private var addBuffer: CharArray = CharArray(maxOf(64, initialText.length * 2))
     private var addLength = 0
 
@@ -216,8 +218,14 @@ class PieceTable(initialText: String = "") {
         while (i < pieces.size && remaining > 0) {
             val p = pieces[i]
             val available = p.length - pieceOff
-            val take = minOf(available, remaining)
+            if (available <= 0) { pieceOff = 0; i++; continue }
             val buf = if (p.source == BufferType.ORIGINAL) originalBuffer else addBuffer
+            // Clamp to actual buffer capacity — guards against any piece that
+            // has drifted out of bounds due to concurrent resets or other
+            // invariant violations, preventing an OOB crash on the EDT.
+            val bufRemaining = buf.size - p.offset - pieceOff
+            val take = minOf(available, remaining, bufRemaining)
+            if (take <= 0) { pieceOff = 0; i++; continue }
             builder.append(buf, p.offset + pieceOff, p.offset + pieceOff + take)
             remaining -= take
             pieceOff = 0
@@ -231,6 +239,13 @@ class PieceTable(initialText: String = "") {
 
     fun setText(newText: String) {
         pieces.clear()
+        // Allocate a fresh add-buffer sized for the new text plus typical growth
+        // headroom.  Reusing the old buffer across setText calls is dangerous:
+        // a delete on the freshly-loaded piece can shift its offset, and when
+        // subsequent typing coalesces into that shifted piece the combined
+        // offset+length may exceed the still-old buffer.size before the next
+        // resize, producing an IndexOutOfBoundsException in getText.
+        addBuffer = CharArray(maxOf(64, newText.length + (newText.length ushr 1) + 64))
         addLength = 0
         totalLength = newText.length
         invalidateCache()
