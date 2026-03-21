@@ -26,7 +26,7 @@ private data class GeminiCandidate(val content: GeminiContent)
 @Serializable
 private data class GeminiResponse(val candidates: List<GeminiCandidate> = emptyList())
 
-class GeminiClient(var apiKey: String) {
+class GeminiClient(override var apiKey: String) : AiClient {
     private companion object {
         const val CONNECT_TIMEOUT_SECONDS = 10L
         const val READ_TIMEOUT_SECONDS = 30L

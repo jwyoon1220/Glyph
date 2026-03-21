@@ -22,10 +22,22 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     private val dictClient = DictionaryClient()
     private val luceneSearcher = LuceneSearcher()
     private val fileWatcher = FileWatcher(dataRoot, luceneSearcher, repo)
-    private val geminiClient = GeminiClient(
-        java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
-            .get("gemini_api_key", "")
+
+    private val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
+
+    private val geminiClient = GeminiClient(prefs.get("gemini_api_key", ""))
+    private val groqClient = GroqClient(
+        apiKey = prefs.get("groq_api_key", ""),
+        model = prefs.get("groq_model", "qwen/qwen3-32b")
     )
+
+    /** Returns the currently selected AI client based on user preference. */
+    private val activeAiClient: AiClient?
+        get() = when (prefs.get("ai_provider", "gemini")) {
+            "groq"  -> groqClient.takeIf { it.apiKey.isNotBlank() }
+            "gemini" -> geminiClient.takeIf { it.apiKey.isNotBlank() }
+            else    -> null
+        }
 
     private val rootPanel = JPanel(BorderLayout())
 
@@ -64,7 +76,17 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         size = Dimension(1280, 800)
         minimumSize = Dimension(800, 600)
         setLocationRelativeTo(null)
-        defaultCloseOperation = EXIT_ON_CLOSE
+        defaultCloseOperation = DO_NOTHING_ON_CLOSE
+
+        // Save in-memory recovery snapshot before the JVM exits
+        addWindowListener(object : java.awt.event.WindowAdapter() {
+            override fun windowClosing(e: java.awt.event.WindowEvent) {
+                saveRecoveryData()
+                dispose()
+                // Exit only if this is the last window
+                if (JFrame.getFrames().none { it.isVisible }) System.exit(0)
+            }
+        })
 
         // Setup UI
         rootPanel.background = Color(1, 22, 39)
@@ -159,8 +181,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             }
         } else {
             val editor = GlyphTextArea(dictClient)
-            editor.geminiClient = geminiClient
+            editor.aiClient = activeAiClient
             editor.addTypingStoppedListener {
+                // Clear any in-memory crash recovery data once saved to disk
+                prefs.remove("recovery_${relPath.hashCode()}")
                 uiScope.launch(Dispatchers.IO) {
                     repo.saveFile(relPath, editor.text)
                     gitManager.commitAll("Auto-save snapshot ($relPath)")
@@ -191,10 +215,37 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     repo.saveFile(relPath, "")
                     gitManager.commitAll("Initial commit ($relPath)")
                 }
-                val text = repo.loadFile(relPath)
+                // Try to recover unsaved in-memory content from last session
+                val recoveryKey = "recovery_${relPath.hashCode()}"
+                val recoveryText = prefs.get(recoveryKey, null)
+                val diskText = repo.loadFile(relPath)
                 withContext(Dispatchers.Swing) {
-                    editor.text = text
+                    if (recoveryText != null && recoveryText != diskText) {
+                        val choice = JOptionPane.showConfirmDialog(
+                            this@GlyphMainFrame,
+                            "이전 세션에서 저장되지 않은 변경 사항이 있습니다.\n복구하시겠습니까?",
+                            "변경 사항 복구",
+                            JOptionPane.YES_NO_OPTION,
+                            JOptionPane.QUESTION_MESSAGE
+                        )
+                        editor.text = if (choice == JOptionPane.YES_OPTION) recoveryText else diskText
+                        if (choice != JOptionPane.YES_OPTION) prefs.remove(recoveryKey)
+                    } else {
+                        editor.text = diskText
+                        prefs.remove(recoveryKey)
+                    }
                 }
+            }
+        }
+    }
+
+    /** Save all open editor contents to Preferences for crash recovery. */
+    fun saveRecoveryData() {
+        for ((relPath, comp) in openEditors) {
+            val editor = findEditorInComponent(comp) ?: continue
+            val text = editor.text
+            if (text.isNotEmpty()) {
+                prefs.put("recovery_${relPath.hashCode()}", text)
             }
         }
     }
@@ -394,8 +445,6 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         val gitMenu = JMenu("Git")
         gitMenu.mnemonic = KeyEvent.VK_G
 
-        val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
-
         val remoteItem = JMenuItem("리모트 저장소 설정...")
         remoteItem.addActionListener {
             val current = gitManager.getRemoteUrl()
@@ -485,29 +534,70 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         val settingsMenu = JMenu("설정(S)")
         settingsMenu.mnemonic = KeyEvent.VK_S
 
-        val apiKeyItem = JMenuItem("Gemini API 키 설정...")
-        apiKeyItem.addActionListener {
-            val currentKey = prefs.get("gemini_api_key", "")
-            val result = JOptionPane.showInputDialog(
-                this,
-                "Gemini API 키를 입력하세요:",
-                "AI 설정",
-                JOptionPane.PLAIN_MESSAGE,
-                null,
-                null,
-                currentKey
-            ) as? String
-            if (result != null) {
-                prefs.put("gemini_api_key", result)
-                geminiClient.apiKey = result
-            }
+        val aiSettingsItem = JMenuItem("AI 설정...")
+        aiSettingsItem.addActionListener {
+            showAiSettingsDialog()
         }
-        settingsMenu.add(apiKeyItem)
+        settingsMenu.add(aiSettingsItem)
         menuBar.add(settingsMenu)
 
         return menuBar
     }
-}
+
+    private fun showAiSettingsDialog() {
+        val providers = arrayOf("없음 (비활성화)", "Gemini", "Groq")
+        val currentProvider = when (prefs.get("ai_provider", "gemini")) {
+            "gemini" -> 1
+            "groq"   -> 2
+            else     -> 0
+        }
+
+        val panel = JPanel(GridBagLayout())
+        val gbc = GridBagConstraints().apply {
+            fill = GridBagConstraints.HORIZONTAL; insets = Insets(4, 4, 4, 4)
+        }
+
+        val providerBox = JComboBox(providers).apply { selectedIndex = currentProvider }
+        val geminiKeyField = JPasswordField(prefs.get("gemini_api_key", ""), 30)
+        val groqKeyField = JPasswordField(prefs.get("groq_api_key", ""), 30)
+        val groqModelField = JTextField(prefs.get("groq_model", "qwen/qwen3-32b"), 30)
+
+        gbc.gridx = 0; gbc.gridy = 0; panel.add(JLabel("AI 제공자:"), gbc)
+        gbc.gridx = 1; panel.add(providerBox, gbc)
+
+        gbc.gridx = 0; gbc.gridy = 1; panel.add(JLabel("Gemini API 키:"), gbc)
+        gbc.gridx = 1; panel.add(geminiKeyField, gbc)
+
+        gbc.gridx = 0; gbc.gridy = 2; panel.add(JLabel("Groq API 키:"), gbc)
+        gbc.gridx = 1; panel.add(groqKeyField, gbc)
+
+        gbc.gridx = 0; gbc.gridy = 3; panel.add(JLabel("Groq 모델:"), gbc)
+        gbc.gridx = 1; panel.add(groqModelField, gbc)
+
+        val result = JOptionPane.showConfirmDialog(
+            this, panel, "AI 설정", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE
+        )
+        if (result == JOptionPane.OK_OPTION) {
+            val provider = when (providerBox.selectedIndex) {
+                1 -> "gemini"
+                2 -> "groq"
+                else -> "none"
+            }
+            prefs.put("ai_provider", provider)
+            prefs.put("gemini_api_key", String(geminiKeyField.password).trim())
+            prefs.put("groq_api_key", String(groqKeyField.password).trim())
+            prefs.put("groq_model", groqModelField.text.trim())
+
+            geminiClient.apiKey = prefs.get("gemini_api_key", "")
+            groqClient.apiKey = prefs.get("groq_api_key", "")
+            groqClient.model = prefs.get("groq_model", "qwen/qwen3-32b")
+
+            // Apply the new client to all open text editors
+            for (comp in openEditors.values) {
+                findEditorInComponent(comp)?.aiClient = activeAiClient
+            }
+        }
+    }
 
 fun main() {
     // Ultra High-Performance Hardware Acceleration using JNI to Native Window APIs

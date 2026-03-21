@@ -8,9 +8,13 @@ import kotlinx.serialization.encodeToByteArray
 import kotlinx.serialization.protobuf.ProtoBuf
 import kotlinx.serialization.Serializable
 import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
 
 @Serializable
 data class EpisodeData(
@@ -64,11 +68,19 @@ class StorageRepository(private val rootDirectory: File) {
     suspend fun saveFile(relativePath: String, content: String) = withContext(Dispatchers.IO) {
         val file = File(rootDirectory, relativePath)
         file.parentFile?.mkdirs()
-        if (file.name.endsWith(".gle")) {
-            val episode = EpisodeData(file.nameWithoutExtension, content)
-            file.writeBytes(ProtoBuf.encodeToByteArray(episode))
-        } else {
-            file.writeText(content)
+        when {
+            file.name.endsWith(".gle") -> {
+                val episode = EpisodeData(file.nameWithoutExtension, content)
+                file.writeBytes(ProtoBuf.encodeToByteArray(episode))
+            }
+            file.name.endsWith(".glh") -> {
+                // Glyph Header: gzip-compressed UTF-8 markdown
+                val bytes = content.toByteArray(Charsets.UTF_8)
+                val out = ByteArrayOutputStream()
+                GZIPOutputStream(out).use { it.write(bytes) }
+                file.writeBytes(out.toByteArray())
+            }
+            else -> file.writeText(content)
         }
     }
 
@@ -77,18 +89,31 @@ class StorageRepository(private val rootDirectory: File) {
     suspend fun loadFile(relativePath: String): String = withContext(Dispatchers.IO) {
         val file = File(rootDirectory, relativePath)
         if (!file.exists()) return@withContext ""
-        if (file.name.endsWith(".gle")) {
-            try {
-                val bytes = readFileBytes(file)
-                if (bytes.isEmpty()) return@withContext ""
-                val episode = ProtoBuf.decodeFromByteArray<EpisodeData>(bytes)
-                episode.content
-            } catch (e: Exception) {
-                e.printStackTrace()
-                ""
+        when {
+            file.name.endsWith(".gle") -> {
+                try {
+                    val bytes = readFileBytes(file)
+                    if (bytes.isEmpty()) return@withContext ""
+                    val episode = ProtoBuf.decodeFromByteArray<EpisodeData>(bytes)
+                    episode.content
+                } catch (e: Exception) {
+                    // Fallback: try reading as plain text (handles legacy or corrupt files)
+                    try { file.readText() } catch (_: Exception) { "" }
+                }
             }
-        } else {
-            file.readText()
+            file.name.endsWith(".glh") -> {
+                try {
+                    val bytes = readFileBytes(file)
+                    if (bytes.isEmpty()) return@withContext ""
+                    GZIPInputStream(ByteArrayInputStream(bytes)).use {
+                        it.readAllBytes().toString(Charsets.UTF_8)
+                    }
+                } catch (e: Exception) {
+                    // Fallback: try plain text (e.g. .glhr saved without compression)
+                    try { file.readText() } catch (_: Exception) { "" }
+                }
+            }
+            else -> file.readText()
         }
     }
 
