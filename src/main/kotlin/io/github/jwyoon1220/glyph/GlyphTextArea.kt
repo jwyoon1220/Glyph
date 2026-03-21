@@ -248,7 +248,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
     private fun showDictionaryPopup(word: String, x: Int, y: Int) {
         val popup = JPopupMenu()
         popup.border = LineBorder(Color.DARK_GRAY, 1)
-        val textArea = JTextArea("Searching dictionary for: \$word...").apply {
+        val textArea = JTextArea("Searching dictionary for: $word...").apply {
             isEditable = false
             font = Font(this@GlyphTextArea.font.name, Font.PLAIN, 14)
             background = Color(60, 63, 65)
@@ -268,12 +268,12 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent() {
         uiScope.launch {
             val results = dictClient.searchWord(word)
             if (results.isEmpty()) {
-                textArea.text = "No standard dictionary definition found for: \$word"
+                textArea.text = "No standard dictionary definition found for: $word"
             } else {
                 val sb = java.lang.StringBuilder()
                 for (item in results) {
-                    sb.append("【\${item.word}】 " + if (item.pos.isNotEmpty()) "[\${item.pos}]\n" else "\n")
-                    sb.append("\${item.sense.definition}\n\n")
+                    sb.append("【${item.word}】 " + if (item.pos.isNotEmpty()) "[${item.pos}]\n" else "\n")
+                    sb.append("${item.sense.definition}\n\n")
                 }
                 textArea.text = sb.toString()
                 textArea.caretPosition = 0

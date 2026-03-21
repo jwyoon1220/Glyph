@@ -25,13 +25,7 @@ class DictionaryClient {
     private val apiKey = "015A1D4E54506B1C1ADE634E402469F0"
 
     suspend fun searchWord(word: String): List<DictItem> = withContext(Dispatchers.IO) {
-        val url =
-            $$"https://stdict.korean.go.kr/api/search.do?certkey_no=8871&key=$apiKey&type_search=search&req_type=json&q=$${
-                java.net.URLEncoder.encode(
-                    word,
-                    "UTF-8"
-                )
-            }"
+        val url = "https://stdict.korean.go.kr/api/search.do?certkey_no=8871&key=$apiKey&type_search=search&req_type=json&q=${word}"
         val request = Request.Builder().url(url).build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@withContext emptyList()
