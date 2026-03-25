@@ -226,7 +226,7 @@ class PieceTable(initialText: String = "") {
             val bufRemaining = buf.size - p.offset - pieceOff
             val take = minOf(available, remaining, bufRemaining)
             if (take <= 0) { pieceOff = 0; i++; continue }
-            builder.append(buf, p.offset + pieceOff, p.offset + pieceOff + take)
+            builder.append(buf, p.offset + pieceOff, take)
             remaining -= take
             pieceOff = 0
             i++

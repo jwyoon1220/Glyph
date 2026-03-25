@@ -47,6 +47,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-protobuf:1.10.0")
     // Source: https://mvnrepository.com/artifact/org.jetbrains.kotlinx/kotlinx-serialization-json-jvm
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json-jvm:1.10.0")
+    
+    // Markdown
+    implementation("org.commonmark:commonmark:0.21.0")
 
 }
 

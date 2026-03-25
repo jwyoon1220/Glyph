@@ -39,7 +39,7 @@ class GeminiClient(override var apiKey: String) : AiClient {
     private val json = Json { ignoreUnknownKeys = true }
     private val mediaType = "application/json; charset=utf-8".toMediaType()
 
-    suspend fun getSuggestion(contextText: String): String = withContext(Dispatchers.IO) {
+    override suspend fun getSuggestion(contextText: String): String = withContext(Dispatchers.IO) {
         val key = apiKey
         if (key.isBlank()) return@withContext ""
 

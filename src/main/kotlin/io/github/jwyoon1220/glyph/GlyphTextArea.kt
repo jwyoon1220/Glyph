@@ -6,6 +6,7 @@ import io.github.jwyoon1220.glyph.search.DictionaryClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.swing.Swing
 import java.awt.*
@@ -58,6 +59,17 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     /** Optional undo handler supplied by the owner (e.g. git-based restore). */
     var onUndoRequested: (() -> Unit)? = null
 
+    private val highlighter = MarkdownHighlighter()
+    private var styledSpans: List<StyleSpan> = emptyList()
+    
+    private fun scheduleHighlightUpdate() {
+        uiScope.launch {
+            val fullText = pieceTable.getText(0, pieceTable.length)
+            styledSpans = highlighter.parseSpans(fullText)
+            repaint()
+        }
+    }
+
     var text: String
         get() = pieceTable.getText(0, pieceTable.length)
         set(value) {
@@ -65,8 +77,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             caretOffset = minOf(caretOffset, value.length)
             clearSelection()
             compositionText = ""
-            clearSelection()
-            compositionText = ""
+            scheduleHighlightUpdate()
             revalidate()
             repaint()
         }
@@ -100,7 +111,8 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
         aiSuggestionTimer = Timer(AI_SUGGESTION_DELAY_MS) {
             if (caretOffset < pieceTable.length || compositionText.isNotEmpty()) return@Timer
-            val currentText = pieceTable.getText(0, pieceTable.length)
+            val start = maxOf(0, caretOffset - 1500)
+            val currentText = pieceTable.getText(start, caretOffset)
             if (currentText.isBlank()) return@Timer
 
             aiJob = uiScope.launch {
@@ -161,6 +173,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     pieceTable.insert(caretOffset, comText)
                     caretOffset += comText.length
                     resetInactivityTimer()
+                    scheduleHighlightUpdate()
                 }
                 
                 compositionText = if (composed.length > committed) composed.substring(committed) else ""
@@ -184,6 +197,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     caretOffset++
                     showCaret = true
                     resetInactivityTimer()
+                    scheduleHighlightUpdate()
                     repaint()
                 }
             }
@@ -244,21 +258,26 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         caretOffset++
                         clearSelection()
                         resetInactivityTimer()
+                        scheduleHighlightUpdate()
                     }
                     KeyEvent.VK_BACK_SPACE -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) {
                             deleteSelection()
+                            scheduleHighlightUpdate()
                         } else if (caretOffset > 0) {
                             pieceTable.delete(caretOffset - 1, 1)
                             caretOffset--
+                            scheduleHighlightUpdate()
                         }
                         resetInactivityTimer()
                     }
                     KeyEvent.VK_DELETE -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) {
                             deleteSelection()
+                            scheduleHighlightUpdate()
                         } else if (caretOffset < pieceTable.length) {
                             pieceTable.delete(caretOffset, 1)
+                            scheduleHighlightUpdate()
                         }
                         resetInactivityTimer()
                     }
@@ -468,20 +487,26 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         textPane.text = "$htmlPrefix$headerHtml<i>단어 뜻을 찾는 중...</i>$htmlSuffix"
 
         uiScope.launch {
-            val results = dictClient.searchWord(word)
-            if (results.isEmpty()) {
-                textPane.text = htmlPrefix + headerHtml + "사전에서 뜻을 찾을 수 없습니다." + htmlSuffix
-            } else {
-                val sb = java.lang.StringBuilder()
-                for (item in results) {
-                    sb.append("<div style='margin-bottom: 4px;'>")
-                    sb.append("<span style='color: #6AAB73; font-weight: bold;'>【${item.word}】</span> ")
-                    if (item.pos.isNotEmpty()) sb.append("<span style='color: #E8BF6A;'>[${item.pos}]</span> ")
-                    sb.append("</div>")
-                    sb.append("<div style='margin-bottom: 12px; margin-left: 10px; line-height: 1.4;'>${item.sense.definition}</div>")
-                }
-                textPane.text = htmlPrefix + headerHtml + sb.toString() + htmlSuffix
+            val wikiEntry = io.github.jwyoon1220.glyph.wiki.WikiIndexer.index[word]
+            if (wikiEntry != null) {
+                textPane.text = htmlPrefix + headerHtml + "<div style='color: #6AAB73; font-weight: bold;'>[Wiki: ${wikiEntry.sourceFile}]</div><div style='margin-top: 8px; line-height: 1.4;'>" + wikiEntry.description.replace("\n", "<br>") + "</div>" + htmlSuffix
                 textPane.caretPosition = 0
+            } else {
+                val results = dictClient.searchWord(word)
+                if (results.isEmpty()) {
+                    textPane.text = htmlPrefix + headerHtml + "사전에서 뜻을 찾을 수 없습니다." + htmlSuffix
+                } else {
+                    val sb = java.lang.StringBuilder()
+                    for (item in results) {
+                        sb.append("<div style='margin-bottom: 4px;'>")
+                        sb.append("<span style='color: #6AAB73; font-weight: bold;'>【${item.word}】</span> ")
+                        if (item.pos.isNotEmpty()) sb.append("<span style='color: #E8BF6A;'>[${item.pos}]</span> ")
+                        sb.append("</div>")
+                        sb.append("<div style='margin-bottom: 12px; margin-left: 10px; line-height: 1.4;'>${item.sense.definition}</div>")
+                    }
+                    textPane.text = htmlPrefix + headerHtml + sb.toString() + htmlSuffix
+                    textPane.caretPosition = 0
+                }
             }
         }
     }
@@ -570,6 +595,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             pieceTable.insert(caretOffset, text)
             caretOffset += text.length
             clearSelection()
+            scheduleHighlightUpdate()
         }
     }
 
@@ -702,6 +728,11 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         val fm = g2d.fontMetrics
         val lineHeight = fm.height
         val ascent = fm.ascent
+        
+        val baseFont = font
+        val boldFont = baseFont.deriveFont(Font.BOLD)
+        val italicFont = baseFont.deriveFont(Font.ITALIC)
+        val boldItalicFont = baseFont.deriveFont(Font.BOLD or Font.ITALIC)
 
         val fullText = pieceTable.getText(0, pieceTable.length)
         val lines = fullText.split('\n')
@@ -733,7 +764,6 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             }
         }
 
-        g2d.color = Color(214, 222, 235) // Night Owl Foreground
         var currentOff = 0
         var caretX = 0
         var caretY = 0
@@ -746,41 +776,67 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             val lineStart = currentOff
             val lineEnd = currentOff + lineStr.length
             
-            if (caretOffset in lineStart..lineEnd) {
-                foundCaret = true
-                caretY = i * lineHeight
+            // Draw line character by character based on spans
+            var currentX = 0
+            for (charIdx in lineStr.indices) {
+                val globalIdx = lineStart + charIdx
+                val c = lineStr[charIdx].toString()
                 
-                val relOff = caretOffset - lineStart
-                val prefix = lineStr.substring(0, relOff)
-                val suffix = lineStr.substring(relOff)
+                // Determine style for this character
+                var isBold = false
+                var isItalic = false
+                var color: Color? = null
                 
-                // 1. Draw Prefix
-                g2d.drawString(prefix, 0, y)
-                val px = fm.stringWidth(prefix)
-                caretX = px
-                
-                var currentX = px
-                
-                // 2. Draw Composition Text
-                if (compositionText.isNotEmpty()) {
-                    g2d.color = Color(247, 140, 108) // Night Owl Composition Highlight
-                    g2d.drawString(compositionText, px, y)
-                    
-                    val compWidth = fm.stringWidth(compositionText)
-                    // Draw composition underline (IntelliJ-ish)
-                    g2d.drawLine(px, y + 2, px + compWidth, y + 2)
-                    
-                    g2d.color = Color(214, 222, 235)
-                    currentX += compWidth
+                for (span in styledSpans) {
+                    if (globalIdx >= span.startOffset && globalIdx < span.endOffset) {
+                        if (span.isBold) isBold = true
+                        if (span.isItalic) isItalic = true
+                        if (span.color != null) color = span.color
+                    }
                 }
                 
-                // 3. Draw Suffix (Offset by composition width)
-                g2d.drawString(suffix, currentX, y)
-
-                // Handover caret position for later caret drawing
-                // (cx is usually after composition)
-            } else {
-                g2d.drawString(lineStr, 0, y)
+                g2d.font = when {
+                    isBold && isItalic -> boldItalicFont
+                    isBold -> boldFont
+                    isItalic -> italicFont
+                    else -> baseFont
+                }
+                g2d.color = color ?: Color(214, 222, 235)
+                
+                val charW = g2d.fontMetrics.stringWidth(c)
+                
+                // If it's the caret position, measure composition etc
+                if (globalIdx == caretOffset) {
+                    foundCaret = true
+                    caretY = i * lineHeight
+                    caretX = currentX
+                    
+                    if (compositionText.isNotEmpty()) {
+                        g2d.color = Color(247, 140, 108)
+                        g2d.drawString(compositionText, currentX, y)
+                        val compWidth = g2d.fontMetrics.stringWidth(compositionText)
+                        g2d.drawLine(currentX, y + 2, currentX + compWidth, y + 2)
+                        currentX += compWidth
+                        g2d.color = color ?: Color(214, 222, 235)
+                    }
+                }
+                
+                g2d.drawString(c, currentX, y)
+                currentX += charW
+            }
+            
+            // Caret at end of line
+            if (caretOffset == lineEnd) {
+                foundCaret = true
+                caretY = i * lineHeight
+                caretX = currentX
+                if (compositionText.isNotEmpty()) {
+                    g2d.color = Color(247, 140, 108)
+                    g2d.drawString(compositionText, currentX, y)
+                    val compWidth = g2d.fontMetrics.stringWidth(compositionText)
+                    g2d.drawLine(currentX, y + 2, currentX + compWidth, y + 2)
+                    currentX += compWidth
+                }
             }
             
             // Draw Hover Underline if any
@@ -868,4 +924,4 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         revalidate()
         super.repaint()
     }
-}
+}

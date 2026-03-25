@@ -72,9 +72,15 @@ class FileWatcher(
 
     private suspend fun indexFile(file: File) {
         when {
+            file.name.endsWith(".glhr") -> {
+                if (file.canRead()) {
+                    val content = withContext(Dispatchers.IO) { file.readText() }
+                    luceneSearcher.indexDocument(file.nameWithoutExtension, content)
+                    io.github.jwyoon1220.glyph.wiki.WikiIndexer.scanProject(watchRoot)
+                }
+            }
             file.name.endsWith(".md") || file.name.endsWith(".gle")
-                    || file.name.endsWith(".glp") || file.name.endsWith(".glw")
-                    || file.name.endsWith(".glhr") -> {
+                    || file.name.endsWith(".glp") || file.name.endsWith(".glw") -> {
                 if (file.canRead()) {
                     val content = withContext(Dispatchers.IO) { file.readText() }
                     luceneSearcher.indexDocument(file.nameWithoutExtension, content)
@@ -85,6 +91,7 @@ class FileWatcher(
                 val relPath = file.relativeTo(watchRoot).path.replace('\\', '/')
                 val content = storageRepository.loadFile(relPath)
                 if (content.isNotEmpty()) luceneSearcher.indexDocument(file.nameWithoutExtension, content)
+                io.github.jwyoon1220.glyph.wiki.WikiIndexer.scanProject(watchRoot)
             }
             file.name.endsWith(".glb") -> {
                 luceneSearcher.indexDocument(file.nameWithoutExtension, file.name)
