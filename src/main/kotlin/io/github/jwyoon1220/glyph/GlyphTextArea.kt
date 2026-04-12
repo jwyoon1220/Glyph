@@ -143,11 +143,22 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         if (caretOffset == 0) return ""
         val fullText = pieceTable.getText(0, pieceTable.length)
         var i = caretOffset - 1
-        while (i >= 0 && fullText[i].let { it.isLetterOrDigit() || it in '\uAC00'..'\uD7A3' || it in '\u3131'..'\u314E' || it in '\u314F'..'\u3163' }) {
+        while (i >= 0 && isWordChar(fullText[i])) {
             i--
         }
         return fullText.substring(i + 1, caretOffset)
     }
+
+    /**
+     * Returns true if [c] is a word character for autocomplete purposes.
+     * Includes ASCII letters/digits as well as Korean syllables (완성형, U+AC00–U+D7A3)
+     * and Korean jamo (compatibility jamo U+3131–U+3163).
+     */
+    private fun isWordChar(c: Char): Boolean =
+        c.isLetterOrDigit()
+            || c in '\uAC00'..'\uD7A3'  // Korean syllable blocks (Hangul)
+            || c in '\u3131'..'\u314E'  // Korean consonant jamo
+            || c in '\u314F'..'\u3163' // Korean vowel jamo
 
     /** Schedules an autocomplete lookup after a short debounce delay. */
     private fun scheduleAutocomplete() {

@@ -150,7 +150,9 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                         if (content.isNotEmpty()) {
                             luceneSearcher.indexDocument(file.nameWithoutExtension, content)
                         }
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        System.err.println("[GlyphMainFrame] Failed to index '${file.path}': ${e.message}")
+                    }
                 }
         }
 
@@ -366,7 +368,8 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     sb.append("<span style='color:#4C5052;font-size:10px;'>/</span>")
                     sb.append("<span style='color:$color;font-size:10px;'>${token.pos}</span> ")
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                System.err.println("[GlyphMainFrame] Morphological analysis failed: ${e.message}")
                 sb.append(sentence)
             }
 
