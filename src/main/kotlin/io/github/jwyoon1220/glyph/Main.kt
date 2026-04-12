@@ -22,6 +22,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     private val dictClient = DictionaryClient()
     private val luceneSearcher = LuceneSearcher()
     private val fileWatcher = FileWatcher(dataRoot, luceneSearcher, repo)
+    private val wikiIndexer = WikiIndexer()
 
     private val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
 
@@ -69,6 +70,14 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         border = BorderFactory.createEmptyBorder(2, 8, 2, 8)
     }
 
+    /** Right-panel pane that displays morphological analysis for selected text. */
+    private val morphAnalysisPane = JTextPane().apply {
+        isEditable = false
+        contentType = "text/html"
+        background = Color(43, 45, 48)
+        border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
+    }
+
     // Coroutine Scope for UI
     private val uiScope = CoroutineScope(Dispatchers.Swing + Job())
 
@@ -113,6 +122,37 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
 
         // Start the file watcher for real-time Lucene indexing
         fileWatcher.start()
+
+        // Background scan: index all existing project files on startup
+        uiScope.launch(Dispatchers.IO) {
+            dataRoot.walkTopDown()
+                .filter { it.isFile && !it.name.startsWith(".") }
+                .forEach { file ->
+                    try {
+                        val content = when {
+                            file.name.endsWith(".gle") || file.name.endsWith(".md") ||
+                            file.name.endsWith(".glhr") || file.name.endsWith(".glp") ->
+                                file.readText()
+                            file.name.endsWith(".glh") -> {
+                                val relPath = file.relativeTo(dataRoot).path.replace('\\', '/')
+                                repo.loadFile(relPath)
+                            }
+                            file.name.endsWith(".glw") -> {
+                                val relPath = file.relativeTo(dataRoot).path.replace('\\', '/')
+                                val graph = repo.loadWiki(relPath)
+                                if (graph != null) {
+                                    wikiIndexer.indexGraph(graph)
+                                }
+                                graph?.nodes?.joinToString(" ") { it.title + " " + it.content } ?: ""
+                            }
+                            else -> return@forEach
+                        }
+                        if (content.isNotEmpty()) {
+                            luceneSearcher.indexDocument(file.nameWithoutExtension, content)
+                        }
+                    } catch (_: Exception) {}
+                }
+        }
 
         // Open untitled by default
         openFile("Untitled.gle")
@@ -164,11 +204,14 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     repo.saveWiki(relPath, graph)
                     gitManager.commitAll("Initial Wiki mapping ($relPath)")
                 }
+                // Index wiki terms for autocomplete
+                wikiIndexer.indexGraph(graph)
 
                 withContext(Dispatchers.Swing) {
                     val editor = WikiGraphEditorComponent(graph) { changedGraph ->
                         uiScope.launch(Dispatchers.IO) {
                             repo.saveWiki(relPath, changedGraph)
+                            wikiIndexer.indexGraph(changedGraph)
                         }
                     }
                     editor.onTypingStopped = {
@@ -207,6 +250,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         } else {
             val editor = GlyphTextArea(dictClient)
             editor.aiClient = activeAiClient
+            editor.wikiIndexer = wikiIndexer
+            editor.onSelectionChanged = { selectedText ->
+                updateMorphAnalysisPanel(selectedText)
+            }
             editor.addTypingStoppedListener {
                 // Clear any in-memory crash recovery data once saved to disk
                 prefs.remove("recovery_${relPath.hashCode()}")
@@ -286,6 +333,65 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         }
     }
 
+    /**
+     * Updates the morphological analysis panel in the right tool window with
+     * a colour-coded breakdown of the selected text.
+     * Komoran analysis runs on the Swing dispatcher (consistent with hover popup).
+     * The 300-character cap keeps execution time short enough to avoid stutter.
+     */
+    private fun updateMorphAnalysisPanel(selectedText: String) {
+        if (selectedText.isBlank()) {
+            morphAnalysisPane.text = ""
+            return
+        }
+        // Run on Swing (EDT-equivalent) so Komoran's internal state is accessed
+        // from a single thread, matching the existing hover-popup code path.
+        uiScope.launch {
+            val sentence = selectedText.take(300)
+            val sb = StringBuilder()
+            sb.append("<html><body style='font-family:sans-serif;font-size:13px;color:#A9B7C6;margin:4px;'>")
+            sb.append("<div style='font-size:11px;color:#6A9955;margin-bottom:6px;'>형태소 분석 (Ctrl+T: 유의어)</div>")
+
+            try {
+                val analyzer = io.github.jwyoon1220.glyph.hangul.KoreanMorphemeAnalyzer(sentence)
+                for (token in analyzer.getTokens()) {
+                    val color = when {
+                        token.pos.startsWith("N") -> "#9876AA"
+                        token.pos.startsWith("J") -> "#CC7832"
+                        token.pos.startsWith("V") -> "#FFC66D"
+                        token.pos.startsWith("M") -> "#6A8759"
+                        else -> "#A9B7C6"
+                    }
+                    sb.append("<span style='color:$color;' title='${token.pos}'>${token.morph}</span>")
+                    sb.append("<span style='color:#4C5052;font-size:10px;'>/</span>")
+                    sb.append("<span style='color:$color;font-size:10px;'>${token.pos}</span> ")
+                }
+            } catch (_: Exception) {
+                sb.append(sentence)
+            }
+
+            // Show wiki term matches for the selected text (ConcurrentHashMap — safe on any thread)
+            val wikiMatches = wikiIndexer.getSuggestions(selectedText.trim(), limit = 3, minPrefixLength = 1)
+            if (wikiMatches.isNotEmpty()) {
+                sb.append("<hr style='border:0;border-top:1px solid #3C4050;margin:6px 0;'/>")
+                sb.append("<div style='font-size:11px;color:#6A9955;margin-bottom:4px;'>Wiki 관련 항목</div>")
+                for (term in wikiMatches) {
+                    val excerpt = wikiIndexer.getExcerpt(term)?.take(80) ?: ""
+                    sb.append("<div style='margin-bottom:4px;'>")
+                    sb.append("<span style='color:#82AAFF;font-weight:bold;'>$term</span>")
+                    if (excerpt.isNotEmpty()) {
+                        sb.append("<div style='color:#777;font-size:11px;margin-left:8px;'>$excerpt…</div>")
+                    }
+                    sb.append("</div>")
+                }
+            }
+
+            sb.append("</body></html>")
+            morphAnalysisPane.text = sb.toString()
+            morphAnalysisPane.caretPosition = 0
+        }
+    }
+
     private fun findEditorInComponent(comp: Component): GlyphTextArea? {
         if (comp is GlyphTextArea) return comp
         if (comp is JScrollPane) {
@@ -322,44 +428,85 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
 
         val topBar = JPanel(BorderLayout())
         topBar.isOpaque = false
-        val inputField = JTextField()
-        inputField.background = Color(69, 73, 74)
-        inputField.foreground = Color.WHITE
-        inputField.caretColor = Color.WHITE
-        val searchBtn = JButton("Search")
+        val inputField = io.github.jwyoon1220.glyph.ui.GlyphTextField(20).apply {
+            hint = "단어 검색…"
+            preferredSize = Dimension(0, 28)
+        }
+        val searchBtn = io.github.jwyoon1220.glyph.ui.GlyphButton("Search").apply {
+            preferredSize = Dimension(70, 28)
+        }
         topBar.add(inputField, BorderLayout.CENTER)
         topBar.add(searchBtn, BorderLayout.EAST)
         panel.add(topBar, BorderLayout.NORTH)
 
-        val resultArea = JTextArea()
-        resultArea.background = Color(43, 43, 43)
-        resultArea.foreground = Color.WHITE
-        resultArea.font = Font("SansSerif", Font.PLAIN, 14)
-        resultArea.lineWrap = true
-        resultArea.wrapStyleWord = true
-        resultArea.isEditable = false
-        panel.add(JScrollPane(resultArea), BorderLayout.CENTER)
+        // Dictionary search results pane
+        val resultPane = JTextPane().apply {
+            isEditable = false
+            contentType = "text/html"
+            background = Color(43, 43, 43)
+            border = BorderFactory.createEmptyBorder(6, 6, 6, 6)
+        }
+        val searchScrollPane = JScrollPane(resultPane).apply {
+            border = BorderFactory.createEmptyBorder()
+            preferredSize = Dimension(0, 180)
+        }
+
+        // Morphological analysis pane (shows analysis of selected text)
+        val morphLabel = JLabel("  형태소 분석").apply {
+            font = Font("SansSerif", Font.PLAIN, 11)
+            foreground = Color(100, 150, 100)
+            border = BorderFactory.createMatteBorder(1, 0, 0, 0, Color(50, 55, 65))
+        }
+        val morphScrollPane = JScrollPane(morphAnalysisPane).apply {
+            border = BorderFactory.createEmptyBorder()
+        }
+
+        val centerPanel = JPanel(BorderLayout())
+        centerPanel.isOpaque = false
+        centerPanel.add(searchScrollPane, BorderLayout.NORTH)
+        centerPanel.add(morphLabel, BorderLayout.CENTER)
+        centerPanel.add(morphScrollPane, BorderLayout.SOUTH)
+        // Give the morphological pane most of the space via a JSplitPane
+        val splitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT, searchScrollPane, JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(morphLabel, BorderLayout.NORTH)
+            add(morphScrollPane, BorderLayout.CENTER)
+        }).apply {
+            resizeWeight = 0.35
+            border = BorderFactory.createEmptyBorder()
+            isOpaque = false
+        }
+        panel.add(splitPane, BorderLayout.CENTER)
+
+        val htmlPrefix = "<html><body style='font-family:sans-serif;font-size:13px;color:#A9B7C6;margin:4px;'>"
+        val htmlSuffix = "</body></html>"
 
         val executeSearch = {
             val query = inputField.text
             if (query.isNotBlank()) {
-                resultArea.text = "Searching '$query'..."
+                resultPane.text = "${htmlPrefix}Searching '${query}'…${htmlSuffix}"
                 uiScope.launch {
                     val results = dictClient.searchWord(query)
-                    if (results.isEmpty()) {
-                        resultArea.text = "No results found for '$query'."
+                    val html = if (results.isEmpty()) {
+                        "${htmlPrefix}결과 없음: '${query}'${htmlSuffix}"
                     } else {
-                        val sb = StringBuilder()
+                        val sb = StringBuilder(htmlPrefix)
                         for (item in results) {
-                            sb.append("【${item.word}】 " + if (item.pos.isNotEmpty()) "[${item.pos}]\n" else "\n")
-                            sb.append("${item.sense.definition}\n\n")
+                            sb.append("<div style='margin-bottom:4px;'>")
+                            sb.append("<span style='color:#6AAB73;font-weight:bold;'>【${item.word}】</span> ")
+                            if (item.pos.isNotEmpty()) sb.append("<span style='color:#E8BF6A;'>[${item.pos}]</span>")
+                            sb.append("</div>")
+                            sb.append("<div style='margin-bottom:10px;margin-left:10px;'>${item.sense.definition}</div>")
                         }
-                        resultArea.text = sb.toString()
+                        sb.append(htmlSuffix)
+                        sb.toString()
                     }
+                    resultPane.text = html
+                    resultPane.caretPosition = 0
                 }
             }
         }
-        searchBtn.addActionListener { executeSearch() }
+        searchBtn.addClickListener { executeSearch() }
         inputField.addActionListener { executeSearch() }
 
         return panel
@@ -410,10 +557,10 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             }
         }
 
-        val btnRefresh = JButton("Refresh Log")
-        btnRefresh.addActionListener {
-            gitLogComponent.refresh()
+        val btnRefresh = io.github.jwyoon1220.glyph.ui.GlyphButton("Refresh Log").apply {
+            preferredSize = Dimension(110, 26)
         }
+        btnRefresh.addClickListener { gitLogComponent.refresh() }
 
         val topBar = JPanel(FlowLayout(FlowLayout.LEFT))
         topBar.isOpaque = false

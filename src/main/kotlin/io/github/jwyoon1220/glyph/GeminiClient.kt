@@ -43,8 +43,18 @@ class GeminiClient(override var apiKey: String) : AiClient {
         val key = apiKey
         if (key.isBlank()) return@withContext ""
 
-        val prompt = "당신은 소설 작가 보조 AI입니다. 다음 글의 자연스러운 다음 내용을 한국어로 이어서 작성해주세요. " +
-            "한 문장 또는 그 이하의 짧은 텍스트만 제안해주세요. 기존 텍스트를 반복하지 마세요.\n\n글:\n$contextText"
+        val wordCount = contextText.trim().split("\\s+".toRegex()).size
+        val recentContext = if (contextText.length > 2000) contextText.takeLast(2000) else contextText
+        val prompt = """당신은 창작 소설 및 문서 편집기 'Glyph'에 내장된 AI 작가 보조 시스템입니다.
+다음 지침을 엄격히 따르세요:
+1. 기존 텍스트의 문체, 어조, 시점(1인칭/3인칭 등)을 그대로 유지하세요.
+2. 등장인물의 이름, 성격, 관계를 일관되게 유지하세요.
+3. 한 문장 이하의 짧은 텍스트(최대 50 어절)만 제안하세요.
+4. 기존 텍스트를 절대 반복하지 마세요. 오직 이어지는 내용만 작성하세요.
+5. 현재까지 약 ${wordCount}개의 단어가 작성되었습니다. 흐름을 자연스럽게 이어주세요.
+
+--- 현재까지의 글 ---
+$recentContext"""
 
         val requestBody = json.encodeToString(
             GeminiRequest(listOf(GeminiContent(listOf(GeminiPart(prompt)))))
