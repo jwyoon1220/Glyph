@@ -24,6 +24,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     private companion object {
         const val AI_SUGGESTION_DELAY_MS = 500
         val GHOST_TEXT_COLOR = Color(128, 128, 128)
+        /** Highlight colours for the in-editor search results. */
+        val SEARCH_MATCH_COLOR  = Color(80, 65, 10)   // dark amber – all matches
+        val SEARCH_ACTIVE_COLOR = Color(200, 100, 0)  // orange    – current match
     }
 
     private val pieceTable = PieceTable()
@@ -69,6 +72,10 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     private var autocompletePopup: JPopupMenu? = null
     private var autocompleteTimer: Timer? = null
 
+    // Search highlight state (controlled by FindBar via GlyphMainFrame)
+    private val searchHighlightRanges = ObjectArrayList<IntRange>()
+    private var activeSearchIndex = -1
+
     var text: String
         get() = pieceTable.getText(0, pieceTable.length)
         set(value) {
@@ -84,6 +91,43 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
     fun addTypingStoppedListener(listener: () -> Unit) {
         typingStoppedListeners.add(listener)
+    }
+
+    // ---------------------------------------------------------------- search highlights
+
+    /** Highlights all [ranges] in the editor and marks [activeIndex] as the current match. */
+    fun setSearchHighlights(ranges: List<IntRange>, activeIndex: Int) {
+        searchHighlightRanges.clear()
+        searchHighlightRanges.addAll(ranges)
+        activeSearchIndex = activeIndex
+        if (activeIndex in ranges.indices) scrollToMatch(ranges[activeIndex])
+        repaint()
+    }
+
+    /** Removes all search highlights. */
+    fun clearSearchHighlights() {
+        searchHighlightRanges.clear()
+        activeSearchIndex = -1
+        repaint()
+    }
+
+    private fun scrollToMatch(range: IntRange) {
+        val fm = getFontMetrics(font) ?: return
+        val lines = getLines()
+        var off = 0
+        for (i in lines.indices) {
+            val lineEnd = off + lines[i].length
+            if (range.first in off..lineEnd) {
+                val col = (range.first - off).coerceIn(0, lines[i].length)
+                val cx  = fm.stringWidth(lines[i].substring(0, col))
+                val cy  = i * fm.height
+                val matchLen = (range.last - range.first + 1).coerceAtMost(lines[i].length - col)
+                val cw  = if (matchLen > 0) fm.stringWidth(lines[i].substring(col, col + matchLen)) else fm.charWidth(' ')
+                scrollRectToVisible(Rectangle(cx, cy, cw, fm.height + 20))
+                break
+            }
+            off += lines[i].length + 1
+        }
     }
 
     private fun resetInactivityTimer() {
@@ -925,6 +969,32 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     g2d.fillRect(px, py, if (pw > 0) pw else fm.charWidth(' '), lineHeight)
                 }
                 
+                off += lines[i].length + 1
+            }
+        }
+
+        // Draw search match highlights (behind text)
+        if (searchHighlightRanges.isNotEmpty()) {
+            var off = 0
+            for (i in lines.indices) {
+                val lineStart = off
+                val lineEnd = off + lines[i].length
+                for (idx in searchHighlightRanges.indices) {
+                    val range = searchHighlightRanges[idx]
+                    val rStart = range.first
+                    val rEnd = range.last + 1
+                    if (rStart <= lineEnd && rEnd > lineStart) {
+                        val hStart = maxOf(0, rStart - lineStart)
+                        val hEnd = minOf(lines[i].length, rEnd - lineStart)
+                        if (hEnd > hStart) {
+                            val px = fm.stringWidth(lines[i].substring(0, hStart))
+                            val pw = fm.stringWidth(lines[i].substring(hStart, hEnd)).coerceAtLeast(fm.charWidth(' '))
+                            val py = i * lineHeight
+                            g2d.color = if (idx == activeSearchIndex) SEARCH_ACTIVE_COLOR else SEARCH_MATCH_COLOR
+                            g2d.fillRect(px, py, pw, lineHeight)
+                        }
+                    }
+                }
                 off += lines[i].length + 1
             }
         }

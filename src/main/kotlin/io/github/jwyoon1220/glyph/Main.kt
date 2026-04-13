@@ -8,6 +8,7 @@ import io.github.jwyoon1220.glyph.search.FileWatcher
 import io.github.jwyoon1220.glyph.search.LuceneSearcher
 import io.github.jwyoon1220.glyph.vcs.GitManager
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import kotlinx.coroutines.*
 import kotlinx.coroutines.swing.Swing
 import java.awt.*
@@ -52,6 +53,18 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         })
     }
     private val openEditors = Object2ObjectOpenHashMap<String, Component>()
+
+    /** Find bar shown at the bottom of the editor area when Ctrl+F is pressed. */
+    private val findBar = FindBar()
+    /** Wraps tabbedPane + findBar so the bar slides in without disturbing the split-pane layout. */
+    private val editorAreaPanel = JPanel(BorderLayout()).also { p ->
+        p.isOpaque = false
+        p.add(tabbedPane, BorderLayout.CENTER)
+        p.add(findBar, BorderLayout.SOUTH)
+    }
+    /** Accumulated search matches for the active editor. */
+    private val currentSearchMatches = ObjectArrayList<IntRange>()
+    private var currentSearchMatchIdx = 0
 
     val activeFilePath: String
         get() {
@@ -111,7 +124,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         // Build the tool-window layout via ToolWindowManager (interface-based injection)
         val toolWindowManager = ToolWindowManager(
             left   = object : ToolWindowPanel { override val component = createProjectToolWindow() },
-            center = object : ToolWindowPanel { override val component = tabbedPane },
+            center = object : ToolWindowPanel { override val component = editorAreaPanel },
             right  = object : ToolWindowPanel { override val component = createCharacterToolWindow() },
             bottom = object : ToolWindowPanel { override val component = createVersionControlToolWindow() }
         )
@@ -156,6 +169,9 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     }
                 }
         }
+
+        // Wire up Ctrl+F find bar
+        setupFindBar()
 
         // Open untitled by default
         openFile("Untitled.gle")
@@ -577,6 +593,88 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         SwingUtilities.invokeLater { gitLogComponent.refresh() }
 
         return panel
+    }
+
+    // --- FIND BAR ---
+
+    private fun setupFindBar() {
+        findBar.onSearch = { query, mode, matchCase -> performSearch(query, mode, matchCase) }
+        findBar.onNext   = { navigateMatch(+1) }
+        findBar.onPrev   = { navigateMatch(-1) }
+        findBar.onClose  = { hideFindBar() }
+
+        // Ctrl+F opens/re-focuses the find bar
+        val im = rootPane.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+        val am = rootPane.actionMap
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK), "glyph.showFindBar")
+        am.put("glyph.showFindBar", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent) { showFindBar() }
+        })
+
+        // Re-run search when the user switches tabs
+        tabbedPane.addChangeListener {
+            if (findBar.isVisible) performSearch(findBar.query, findBar.mode, findBar.isCaseSensitive)
+        }
+    }
+
+    private fun showFindBar() {
+        findBar.isVisible = true
+        editorAreaPanel.revalidate()
+        editorAreaPanel.repaint()
+        findBar.focusField()
+        // Run search immediately with the current query (may be from a previous session)
+        if (findBar.query.isNotEmpty()) performSearch(findBar.query, findBar.mode, findBar.isCaseSensitive)
+    }
+
+    private fun hideFindBar() {
+        findBar.isVisible = false
+        activeTextEditor()?.clearSearchHighlights()
+        currentSearchMatches.clear()
+        editorAreaPanel.revalidate()
+        editorAreaPanel.repaint()
+    }
+
+    /** Returns the GlyphTextArea in the currently selected tab, or null. */
+    private fun activeTextEditor(): GlyphTextArea? =
+        findEditorInComponent(tabbedPane.selectedComponent ?: return null)
+
+    private fun performSearch(query: String, mode: SearchMode, matchCase: Boolean) {
+        val editor = activeTextEditor() ?: return
+        currentSearchMatches.clear()
+
+        if (query.isEmpty()) {
+            editor.clearSearchHighlights()
+            findBar.updateMatchCount(0, 0)
+            return
+        }
+
+        val flags = if (matchCase) emptySet() else setOf(RegexOption.IGNORE_CASE)
+        val pattern = try {
+            when (mode) {
+                SearchMode.TEXT  -> Regex(Regex.escape(query), flags)
+                SearchMode.WORD  -> Regex("\\b${Regex.escape(query)}\\b", flags)
+                SearchMode.REGEX -> Regex(query, flags)
+            }
+        } catch (_: Exception) {
+            editor.clearSearchHighlights()
+            findBar.updateMatchCount(0, 0)
+            return
+        }
+
+        for (match in pattern.findAll(editor.text)) {
+            currentSearchMatches.add(match.range)
+        }
+
+        currentSearchMatchIdx = if (currentSearchMatches.isNotEmpty()) 0 else -1
+        editor.setSearchHighlights(currentSearchMatches, currentSearchMatchIdx)
+        findBar.updateMatchCount(currentSearchMatchIdx, currentSearchMatches.size)
+    }
+
+    private fun navigateMatch(dir: Int) {
+        if (currentSearchMatches.isEmpty()) return
+        currentSearchMatchIdx = (currentSearchMatchIdx + dir + currentSearchMatches.size) % currentSearchMatches.size
+        activeTextEditor()?.setSearchHighlights(currentSearchMatches, currentSearchMatchIdx)
+        findBar.updateMatchCount(currentSearchMatchIdx, currentSearchMatches.size)
     }
 
     private fun createMenuBar(): JMenuBar {
