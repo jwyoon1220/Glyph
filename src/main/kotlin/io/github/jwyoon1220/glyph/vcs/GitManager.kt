@@ -44,7 +44,7 @@ class GitManager(private val rootDirectory: File) {
     }
 
     fun getCommitLog(): List<CommitInfo> {
-        val refsMap = Object2ObjectOpenHashMap<String, MutableList<String>>()
+        val refsMap = Object2ObjectOpenHashMap<String, ObjectArrayList<String>>()
         try {
             git.repository.refDatabase.refs.forEach { ref ->
                 val objId = ref.peeledObjectId?.name ?: ref.objectId.name

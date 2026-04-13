@@ -134,7 +134,7 @@ class FindBar : JPanel(BorderLayout()) {
 
     /** Update the "N / Total" counter. Pass -1 / 0 to show "No results". */
     fun updateMatchCount(current: Int, total: Int) {
-        matchCountLabel.text = if (total == 0) "No results" else "${current + 1} / $total"
+        matchCountLabel.text = if (current < 0 || total == 0) "No results" else "${current + 1} / $total"
         queryField.foreground =
             if (total == 0 && queryField.text.isNotEmpty()) Color(255, 100, 100)
             else Color(214, 222, 235)
