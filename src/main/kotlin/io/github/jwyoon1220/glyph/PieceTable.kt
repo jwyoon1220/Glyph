@@ -1,5 +1,7 @@
 package io.github.jwyoon1220.glyph
 
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
+
 /**
  * Optimized PieceTable for storing and editing text.
  *
@@ -25,7 +27,7 @@ class PieceTable(initialText: String = "") {
 
     data class Piece(val source: BufferType, val offset: Int, var length: Int)
 
-    private val pieces = ArrayList<Piece>(16)
+    private val pieces = ObjectArrayList<Piece>(16)
     private var totalLength = initialText.length
 
     // --- Offset cache (prefix sums) ---

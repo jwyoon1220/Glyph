@@ -1,5 +1,6 @@
 package io.github.jwyoon1220.glyph.ui
 
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
@@ -30,7 +31,7 @@ class GlyphButton(private var label: String) : JComponent() {
     private var hovered  = false
     private var pressed  = false
 
-    private val listeners = mutableListOf<() -> Unit>()
+    private val listeners = ObjectArrayList<() -> Unit>()
 
     init {
         isOpaque = false

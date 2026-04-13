@@ -7,6 +7,7 @@ import io.github.jwyoon1220.glyph.search.DictionaryClient
 import io.github.jwyoon1220.glyph.search.FileWatcher
 import io.github.jwyoon1220.glyph.search.LuceneSearcher
 import io.github.jwyoon1220.glyph.vcs.GitManager
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap
 import kotlinx.coroutines.*
 import kotlinx.coroutines.swing.Swing
 import java.awt.*
@@ -50,7 +51,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             openEditors.values.remove(comp)
         })
     }
-    private val openEditors = mutableMapOf<String, Component>()
+    private val openEditors = Object2ObjectOpenHashMap<String, Component>()
 
     val activeFilePath: String
         get() {

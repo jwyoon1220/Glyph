@@ -1,5 +1,6 @@
 package io.github.jwyoon1220.glyph.ui
 
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.awt.*
 import java.awt.event.*
 import java.awt.datatransfer.DataFlavor
@@ -37,8 +38,8 @@ class GlyphTextField(columns: Int = 20) : JComponent() {
     private var showCaret = true
     private val caretTimer = Timer(500) { showCaret = !showCaret; repaint() }
 
-    private val changeListeners = mutableListOf<() -> Unit>()
-    private val actionListeners = mutableListOf<() -> Unit>()
+    private val changeListeners = ObjectArrayList<() -> Unit>()
+    private val actionListeners = ObjectArrayList<() -> Unit>()
 
     /** Placeholder text shown when the field is empty and unfocused. */
     var hint: String = ""

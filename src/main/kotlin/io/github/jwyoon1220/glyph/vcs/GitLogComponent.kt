@@ -1,5 +1,6 @@
 package io.github.jwyoon1220.glyph.vcs
 
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
@@ -92,8 +93,8 @@ class GitLogComponent(
     fun refresh() {
         val commits = gitManager.getCommitLog()
 
-        val rows = mutableListOf<GraphRow>()
-        val lanes = mutableListOf<String>()
+        val rows = ObjectArrayList<GraphRow>()
+        val lanes = ObjectArrayList<String>()
 
         for (commit in commits) {
             val incomingLanes = lanes.toList()

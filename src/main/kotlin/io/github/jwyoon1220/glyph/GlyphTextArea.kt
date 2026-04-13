@@ -14,6 +14,7 @@ import java.awt.font.TextHitInfo
 import java.awt.im.InputMethodRequests
 import java.text.AttributedCharacterIterator
 import java.text.AttributedString
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.util.StringTokenizer
 import javax.swing.*
 import javax.swing.border.LineBorder
@@ -42,7 +43,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     private var hideTimer: Timer? = null
 
     /** Listeners notified after a period of typing inactivity (for auto-commit). */
-    private val typingStoppedListeners = mutableListOf<() -> Unit>()
+    private val typingStoppedListeners = ObjectArrayList<() -> Unit>()
     private var inactivityTimer: Timer? = null
 
     /** AI completion client (optional; set by owner). Supports Gemini, Groq, etc. */
