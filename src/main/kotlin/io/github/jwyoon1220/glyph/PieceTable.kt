@@ -77,6 +77,7 @@ class PieceTable(initialText: String = "") {
 
     private fun appendToAddBuffer(text: String): Int {
         val needed = addLength + text.length
+        BufferUtil.requireCapacity(needed)
         if (needed > addBuffer.size) {
             addBuffer = addBuffer.copyOf(maxOf(needed, addBuffer.size * 2))
         }

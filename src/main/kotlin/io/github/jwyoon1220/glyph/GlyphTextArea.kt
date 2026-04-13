@@ -136,6 +136,38 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         }
     }
 
+    /**
+     * Inserts [text] at [offset] in the piece table.
+     *
+     * If the add-buffer has reached [BufferUtil.MAX_BUFFER_BYTES] this call is
+     * a no-op: the system bell rings once and a modal dialog is shown the first
+     * time the limit is hit so the user knows why further input is being ignored.
+     *
+     * @return `true` if the insert succeeded, `false` if the buffer is full.
+     */
+    private var bufferFullWarningShown = false
+
+    private fun safeInsert(offset: Int, text: String): Boolean {
+        return try {
+            pieceTable.insert(offset, text)
+            true
+        } catch (ex: TextBufferFullException) {
+            Toolkit.getDefaultToolkit().beep()
+            if (!bufferFullWarningShown) {
+                bufferFullWarningShown = true
+                SwingUtilities.invokeLater {
+                    JOptionPane.showMessageDialog(
+                        this,
+                        ex.message,
+                        "버퍼 한도 초과 (Buffer Full)",
+                        JOptionPane.WARNING_MESSAGE
+                    )
+                }
+            }
+            false
+        }
+    }
+
     // ---------------------------------------------------------------- autocomplete
 
     /** Returns the word currently being typed just before the caret. */
@@ -189,8 +221,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 border = BorderFactory.createEmptyBorder(3, 8, 3, 8)
                 addActionListener {
                     val completionSuffix = suggestion.drop(prefix.length)
-                    pieceTable.insert(caretOffset, completionSuffix)
-                    caretOffset += completionSuffix.length
+                    if (safeInsert(caretOffset, completionSuffix)) {
+                        caretOffset += completionSuffix.length
+                    }
                     clearSelection()
                     resetInactivityTimer()
                     repaint()
@@ -304,8 +337,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 if (committed > 0) {
                     val comText = composed.substring(0, committed)
                     if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-                    pieceTable.insert(caretOffset, comText)
-                    caretOffset += comText.length
+                    if (safeInsert(caretOffset, comText)) {
+                        caretOffset += comText.length
+                    }
                     resetInactivityTimer()
                 }
                 
@@ -326,8 +360,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 val c = e.keyChar
                 if (!c.isISOControl() && c != '\b' && c != '\u007F') {
                     if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-                    pieceTable.insert(caretOffset, c.toString())
-                    caretOffset++
+                    if (safeInsert(caretOffset, c.toString())) {
+                        caretOffset++
+                    }
                     showCaret = true
                     resetInactivityTimer()
                     scheduleAutocomplete()
@@ -345,8 +380,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     dismissAutocomplete()
                     if (ghostText.isNotEmpty()) {
                         if (hasActiveSelection()) deleteSelection()
-                        pieceTable.insert(caretOffset, ghostText)
-                        caretOffset += ghostText.length
+                        if (safeInsert(caretOffset, ghostText)) {
+                            caretOffset += ghostText.length
+                        }
                         ghostText = ""
                         clearSelection()
                         resetInactivityTimer()
@@ -389,8 +425,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     KeyEvent.VK_DOWN -> moveCaretLine(1, shift)
                     KeyEvent.VK_ENTER -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-                        pieceTable.insert(caretOffset, "\n")
-                        caretOffset++
+                        if (safeInsert(caretOffset, "\n")) {
+                            caretOffset++
+                        }
                         clearSelection()
                         resetInactivityTimer()
                     }
@@ -724,8 +761,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         if (transferable != null && transferable.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.stringFlavor)) {
             val text = transferable.getTransferData(java.awt.datatransfer.DataFlavor.stringFlavor) as String
             if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-            pieceTable.insert(caretOffset, text)
-            caretOffset += text.length
+            if (safeInsert(caretOffset, text)) {
+                caretOffset += text.length
+            }
             clearSelection()
         }
     }
