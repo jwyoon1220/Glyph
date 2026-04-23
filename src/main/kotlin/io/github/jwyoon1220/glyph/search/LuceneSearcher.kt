@@ -1,5 +1,6 @@
 package io.github.jwyoon1220.glyph.search
 
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import org.apache.lucene.analysis.ko.KoreanAnalyzer
 import org.apache.lucene.document.Document
 import org.apache.lucene.document.Field
@@ -59,7 +60,7 @@ class LuceneSearcher : AutoCloseable {
 
     /** Full-text search; returns up to 10 matching document ids. */
     fun search(queryStr: String): List<String> {
-        val results = mutableListOf<String>()
+        val results = ObjectArrayList<String>()
         try {
             val reader   = nrtReader()  ?: return results
             val searcher = IndexSearcher(reader)

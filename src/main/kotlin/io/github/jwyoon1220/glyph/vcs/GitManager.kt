@@ -4,6 +4,8 @@ import org.eclipse.jgit.api.Git
 import org.eclipse.jgit.api.ResetCommand
 import org.eclipse.jgit.transport.URIish
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.io.File
 
 data class CommitInfo(
@@ -42,11 +44,11 @@ class GitManager(private val rootDirectory: File) {
     }
 
     fun getCommitLog(): List<CommitInfo> {
-        val refsMap = mutableMapOf<String, MutableList<String>>()
+        val refsMap = Object2ObjectOpenHashMap<String, ObjectArrayList<String>>()
         try {
             git.repository.refDatabase.refs.forEach { ref ->
                 val objId = ref.peeledObjectId?.name ?: ref.objectId.name
-                refsMap.computeIfAbsent(objId) { mutableListOf() }.add(ref.name)
+                refsMap.computeIfAbsent(objId) { ObjectArrayList() }.add(ref.name)
             }
 
             val commits = git.log().all().call()

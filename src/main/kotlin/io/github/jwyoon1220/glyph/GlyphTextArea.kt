@@ -14,6 +14,7 @@ import java.awt.font.TextHitInfo
 import java.awt.im.InputMethodRequests
 import java.text.AttributedCharacterIterator
 import java.text.AttributedString
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.util.StringTokenizer
 import javax.swing.*
 import javax.swing.border.LineBorder
@@ -21,8 +22,11 @@ import javax.swing.border.LineBorder
 class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Scrollable {
 
     private companion object {
-        const val AI_SUGGESTION_DELAY_MS = 2000
+        const val AI_SUGGESTION_DELAY_MS = 500
         val GHOST_TEXT_COLOR = Color(128, 128, 128)
+        /** Highlight colours for the in-editor search results. */
+        val SEARCH_MATCH_COLOR  = Color(80, 65, 10)   // dark amber – all matches
+        val SEARCH_ACTIVE_COLOR = Color(200, 100, 0)  // orange    – current match
     }
 
     private val pieceTable = PieceTable()
@@ -42,7 +46,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     private var hideTimer: Timer? = null
 
     /** Listeners notified after a period of typing inactivity (for auto-commit). */
-    private val typingStoppedListeners = mutableListOf<() -> Unit>()
+    private val typingStoppedListeners = ObjectArrayList<() -> Unit>()
     private var inactivityTimer: Timer? = null
 
     /** AI completion client (optional; set by owner). Supports Gemini, Groq, etc. */
@@ -57,6 +61,20 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
     /** Optional undo handler supplied by the owner (e.g. git-based restore). */
     var onUndoRequested: (() -> Unit)? = null
+
+    /** Optional wiki indexer for IntelliJ-style autocomplete. Set by the owner. */
+    var wikiIndexer: WikiIndexer? = null
+
+    /** Called whenever the selection changes; provides selected text (may be blank). */
+    var onSelectionChanged: ((String) -> Unit)? = null
+
+    // Wiki autocomplete popup state
+    private var autocompletePopup: JPopupMenu? = null
+    private var autocompleteTimer: Timer? = null
+
+    // Search highlight state (controlled by FindBar via GlyphMainFrame)
+    private val searchHighlightRanges = ObjectArrayList<IntRange>()
+    private var activeSearchIndex = -1
 
     var text: String
         get() = pieceTable.getText(0, pieceTable.length)
@@ -73,6 +91,43 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
     fun addTypingStoppedListener(listener: () -> Unit) {
         typingStoppedListeners.add(listener)
+    }
+
+    // ---------------------------------------------------------------- search highlights
+
+    /** Highlights all [ranges] in the editor and marks [activeIndex] as the current match. */
+    fun setSearchHighlights(ranges: List<IntRange>, activeIndex: Int) {
+        searchHighlightRanges.clear()
+        searchHighlightRanges.addAll(ranges)
+        activeSearchIndex = activeIndex
+        if (activeIndex in ranges.indices) scrollToMatch(ranges[activeIndex])
+        repaint()
+    }
+
+    /** Removes all search highlights. */
+    fun clearSearchHighlights() {
+        searchHighlightRanges.clear()
+        activeSearchIndex = -1
+        repaint()
+    }
+
+    private fun scrollToMatch(range: IntRange) {
+        val fm = getFontMetrics(font) ?: return
+        val lines = getLines()
+        var off = 0
+        for (i in lines.indices) {
+            val lineEnd = off + lines[i].length
+            if (range.first in off..lineEnd) {
+                val col = (range.first - off).coerceIn(0, lines[i].length)
+                val cx  = fm.stringWidth(lines[i].substring(0, col))
+                val cy  = i * fm.height
+                val matchLen = (range.last - range.first + 1).coerceAtMost(lines[i].length - col)
+                val cw  = if (matchLen > 0) fm.stringWidth(lines[i].substring(col, col + matchLen)) else fm.charWidth(' ')
+                scrollRectToVisible(Rectangle(cx, cy, cw, fm.height + 20))
+                break
+            }
+            off += lines[i].length + 1
+        }
     }
 
     private fun resetInactivityTimer() {
@@ -126,6 +181,175 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         }
     }
 
+    /**
+     * Inserts [text] at [offset] in the piece table.
+     *
+     * If the add-buffer has reached [BufferUtil.MAX_BUFFER_BYTES] this call is
+     * a no-op: the system bell rings once and a modal dialog is shown the first
+     * time the limit is hit so the user knows why further input is being ignored.
+     *
+     * @return `true` if the insert succeeded, `false` if the buffer is full.
+     */
+    private var bufferFullWarningShown = false
+
+    private fun safeInsert(offset: Int, text: String): Boolean {
+        return try {
+            pieceTable.insert(offset, text)
+            true
+        } catch (ex: TextBufferFullException) {
+            Toolkit.getDefaultToolkit().beep()
+            if (!bufferFullWarningShown) {
+                bufferFullWarningShown = true
+                SwingUtilities.invokeLater {
+                    JOptionPane.showMessageDialog(
+                        this,
+                        ex.message,
+                        "버퍼 한도 초과 (Buffer Full)",
+                        JOptionPane.WARNING_MESSAGE
+                    )
+                }
+            }
+            false
+        }
+    }
+
+    // ---------------------------------------------------------------- autocomplete
+
+    /** Returns the word currently being typed just before the caret. */
+    private fun currentWordBeforeCaret(): String {
+        if (caretOffset == 0) return ""
+        val fullText = pieceTable.getText(0, pieceTable.length)
+        var i = caretOffset - 1
+        while (i >= 0 && isWordChar(fullText[i])) {
+            i--
+        }
+        return fullText.substring(i + 1, caretOffset)
+    }
+
+    /**
+     * Returns true if [c] is a word character for autocomplete purposes.
+     * Includes ASCII letters/digits as well as Korean syllables (완성형, U+AC00–U+D7A3)
+     * and Korean jamo (compatibility jamo U+3131–U+3163).
+     */
+    private fun isWordChar(c: Char): Boolean =
+        c.isLetterOrDigit()
+            || c in '\uAC00'..'\uD7A3'  // Korean syllable blocks (Hangul)
+            || c in '\u3131'..'\u314E'  // Korean consonant jamo
+            || c in '\u314F'..'\u3163' // Korean vowel jamo
+
+    /** Schedules an autocomplete lookup after a short debounce delay. */
+    private fun scheduleAutocomplete() {
+        autocompleteTimer?.stop()
+        val indexer = wikiIndexer ?: return
+        val prefix = currentWordBeforeCaret()
+        if (prefix.length < 2) { dismissAutocomplete(); return }
+
+        autocompleteTimer = Timer(150) {
+            val suggestions = indexer.getSuggestions(prefix)
+            if (suggestions.isEmpty()) { dismissAutocomplete(); return@Timer }
+            showAutocompletePopup(suggestions, prefix)
+        }.apply { isRepeats = false; start() }
+    }
+
+    private fun showAutocompletePopup(suggestions: List<String>, prefix: String) {
+        dismissAutocomplete()
+        val popup = JPopupMenu()
+        popup.isFocusable = false
+        popup.border = LineBorder(Color(60, 80, 110), 1)
+        popup.background = Color(24, 32, 46)
+
+        for (suggestion in suggestions) {
+            val item = JMenuItem(suggestion).apply {
+                background = Color(24, 32, 46)
+                foreground = Color(130, 180, 255)
+                font = this@GlyphTextArea.font.deriveFont(Font.PLAIN, 14f)
+                border = BorderFactory.createEmptyBorder(3, 8, 3, 8)
+                addActionListener {
+                    val completionSuffix = suggestion.drop(prefix.length)
+                    if (safeInsert(caretOffset, completionSuffix)) {
+                        caretOffset += completionSuffix.length
+                    }
+                    clearSelection()
+                    resetInactivityTimer()
+                    repaint()
+                }
+            }
+            popup.add(item)
+        }
+
+        // Calculate popup position (below caret)
+        val fm = getFontMetrics(font)
+        val lines = pieceTable.getText(0, pieceTable.length).split('\n')
+        var off = 0
+        for (i in lines.indices) {
+            val len = lines[i].length + 1
+            if (caretOffset >= off && caretOffset < off + len) {
+                val col = caretOffset - off
+                val px = fm.stringWidth(lines[i].substring(0, col))
+                val py = i * fm.height + fm.height
+                popup.show(this, px, py)
+                break
+            }
+            off += len
+        }
+        autocompletePopup = popup
+    }
+
+    private fun dismissAutocomplete() {
+        autocompleteTimer?.stop()
+        autocompletePopup?.isVisible = false
+        autocompletePopup = null
+    }
+
+    // ---------------------------------------------------------------- thesaurus
+
+    /**
+     * Shows a thesaurus / synonym popup for the currently selected word.
+     * Triggered by Ctrl+T.
+     */
+    private fun showThesaurusForSelection() {
+        if (!hasActiveSelection()) return
+        val start = minOf(selectionStart, selectionEnd)
+        val end   = maxOf(selectionStart, selectionEnd)
+        val selectedText = pieceTable.getText(0, pieceTable.length).substring(start, end).trim()
+        if (selectedText.isBlank()) return
+
+        val st = StringTokenizer(selectedText, " .,!?\n\t")
+        val cleanWord = if (st.hasMoreTokens()) st.nextToken() else selectedText
+        val analyzer = KoreanMorphemeAnalyzer(cleanWord)
+        val targetWord = analyzer.extractNouns().firstOrNull() ?: cleanWord
+
+        val sbToken = java.lang.StringBuilder()
+        for (token in analyzer.getTokens()) {
+            val color = when {
+                token.pos.startsWith("N") -> "#9876AA"
+                token.pos.startsWith("J") -> "#CC7832"
+                token.pos.startsWith("V") -> "#FFC66D"
+                token.pos.startsWith("M") -> "#6A8759"
+                else -> "#A9B7C6"
+            }
+            sbToken.append("<span style='color: $color;'>${token.morph}</span>")
+        }
+
+        // Calculate position: find the line containing `start`
+        val fm = getFontMetrics(font)
+        val lines = pieceTable.getText(0, pieceTable.length).split('\n')
+        var off = 0
+        var popupX = 0
+        var popupY = fm.height
+        for (i in lines.indices) {
+            val len = lines[i].length + 1
+            if (start >= off && start < off + len) {
+                val col = start - off
+                popupX = fm.stringWidth(lines[i].substring(0, col))
+                popupY = (i + 1) * fm.height
+                break
+            }
+            off += len
+        }
+        showDictionaryPopup(targetWord, sbToken.toString(), popupX, popupY)
+    }
+
     init {
         isFocusable = true
         
@@ -158,8 +382,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 if (committed > 0) {
                     val comText = composed.substring(0, committed)
                     if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-                    pieceTable.insert(caretOffset, comText)
-                    caretOffset += comText.length
+                    if (safeInsert(caretOffset, comText)) {
+                        caretOffset += comText.length
+                    }
                     resetInactivityTimer()
                 }
                 
@@ -180,10 +405,12 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 val c = e.keyChar
                 if (!c.isISOControl() && c != '\b' && c != '\u007F') {
                     if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-                    pieceTable.insert(caretOffset, c.toString())
-                    caretOffset++
+                    if (safeInsert(caretOffset, c.toString())) {
+                        caretOffset++
+                    }
                     showCaret = true
                     resetInactivityTimer()
+                    scheduleAutocomplete()
                     repaint()
                 }
             }
@@ -195,10 +422,12 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 // Tab: accept AI ghost-text suggestion (or do nothing)
                 if (e.keyCode == KeyEvent.VK_TAB) {
                     e.consume()
+                    dismissAutocomplete()
                     if (ghostText.isNotEmpty()) {
                         if (hasActiveSelection()) deleteSelection()
-                        pieceTable.insert(caretOffset, ghostText)
-                        caretOffset += ghostText.length
+                        if (safeInsert(caretOffset, ghostText)) {
+                            caretOffset += ghostText.length
+                        }
                         ghostText = ""
                         clearSelection()
                         resetInactivityTimer()
@@ -208,9 +437,10 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     return
                 }
 
-                // Escape: dismiss AI suggestion
-                if (e.keyCode == KeyEvent.VK_ESCAPE && ghostText.isNotEmpty()) {
-                    clearGhostText()
+                // Escape: dismiss AI suggestion or autocomplete popup
+                if (e.keyCode == KeyEvent.VK_ESCAPE) {
+                    if (autocompletePopup?.isVisible == true) { dismissAutocomplete(); return }
+                    if (ghostText.isNotEmpty()) { clearGhostText(); return }
                     return
                 }
 
@@ -240,8 +470,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     KeyEvent.VK_DOWN -> moveCaretLine(1, shift)
                     KeyEvent.VK_ENTER -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-                        pieceTable.insert(caretOffset, "\n")
-                        caretOffset++
+                        if (safeInsert(caretOffset, "\n")) {
+                            caretOffset++
+                        }
                         clearSelection()
                         resetInactivityTimer()
                     }
@@ -277,6 +508,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         deleteSelection()
                     }
                     KeyEvent.VK_V -> if (ctrl) pasteFromClipboard()
+                    KeyEvent.VK_T -> if (ctrl) { showThesaurusForSelection(); return }
                 }
                 showCaret = true
                 repaint()
@@ -314,6 +546,13 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 caretOffset = offset
                 selectionEnd = offset
                 repaint()
+                // Notify owner with selected text for morphological analysis panel
+                if (hasActiveSelection()) {
+                    val s = minOf(selectionStart, selectionEnd)
+                    val en = maxOf(selectionStart, selectionEnd)
+                    val sel = pieceTable.getText(0, pieceTable.length).substring(s, en)
+                    onSelectionChanged?.invoke(sel)
+                }
             }
 
             override fun mouseMoved(e: MouseEvent) {
@@ -567,8 +806,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         if (transferable != null && transferable.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.stringFlavor)) {
             val text = transferable.getTransferData(java.awt.datatransfer.DataFlavor.stringFlavor) as String
             if (selectionStart != -1 && selectionStart != selectionEnd) deleteSelection()
-            pieceTable.insert(caretOffset, text)
-            caretOffset += text.length
+            if (safeInsert(caretOffset, text)) {
+                caretOffset += text.length
+            }
             clearSelection()
         }
     }
@@ -729,6 +969,32 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     g2d.fillRect(px, py, if (pw > 0) pw else fm.charWidth(' '), lineHeight)
                 }
                 
+                off += lines[i].length + 1
+            }
+        }
+
+        // Draw search match highlights (behind text)
+        if (searchHighlightRanges.isNotEmpty()) {
+            var off = 0
+            for (i in lines.indices) {
+                val lineStart = off
+                val lineEnd = off + lines[i].length
+                for (idx in searchHighlightRanges.indices) {
+                    val range = searchHighlightRanges[idx]
+                    val rStart = range.first
+                    val rEnd = range.last + 1
+                    if (rStart <= lineEnd && rEnd > lineStart) {
+                        val hStart = maxOf(0, rStart - lineStart)
+                        val hEnd = minOf(lines[i].length, rEnd - lineStart)
+                        if (hEnd > hStart) {
+                            val px = fm.stringWidth(lines[i].substring(0, hStart))
+                            val pw = fm.stringWidth(lines[i].substring(hStart, hEnd)).coerceAtLeast(fm.charWidth(' '))
+                            val py = i * lineHeight
+                            g2d.color = if (idx == activeSearchIndex) SEARCH_ACTIVE_COLOR else SEARCH_MATCH_COLOR
+                            g2d.fillRect(px, py, pw, lineHeight)
+                        }
+                    }
+                }
                 off += lines[i].length + 1
             }
         }

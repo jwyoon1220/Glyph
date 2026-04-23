@@ -1,5 +1,6 @@
 package io.github.jwyoon1220.glyph
 
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import java.io.File
 import java.util.prefs.Preferences
 
@@ -9,7 +10,7 @@ object RecentProjectsManager {
 
     fun addProject(dir: File) {
         val path = dir.absolutePath
-        val current = getRecentProjects().toMutableList()
+        val current = ObjectArrayList(getRecentProjects())
         current.remove(path)
         current.add(0, path)
         
@@ -22,7 +23,7 @@ object RecentProjectsManager {
     }
 
     fun getRecentProjects(): List<String> {
-        val list = mutableListOf<String>()
+        val list = ObjectArrayList<String>()
         for (i in 0 until MAX_RECENTS) {
             val p = prefs.get("recent_$i", null)
             if (p != null) list.add(p)
