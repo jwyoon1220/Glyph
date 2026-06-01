@@ -1,22 +1,19 @@
 package io.github.jwyoon1220.glyph.ui
 
 import it.unimi.dsi.fastutil.objects.ObjectArrayList
+import kotlinx.coroutines.*
+import kotlinx.coroutines.swing.Swing
 import java.awt.*
 import java.awt.event.*
 import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
 import java.awt.geom.RoundRectangle2D
 import javax.swing.JComponent
-import javax.swing.Timer
 
 /**
  * High-performance custom single-line text field component.
  *
- * Avoids the heavyweight Swing [javax.swing.JTextField] overhead:
- *  - Renders directly via [Graphics2D] with hardware-accelerated anti-aliasing.
- *  - Uses a plain [StringBuilder] (not a [javax.swing.text.Document]) as its
- *    backing store – no document-event or element-tree overhead.
- *  - Minimal allocations during [paintComponent].
+ * Renders directly via [Graphics2D] and uses coroutines for caret blinking.
  */
 class GlyphTextField(columns: Int = 20) : JComponent() {
 
@@ -36,7 +33,10 @@ class GlyphTextField(columns: Int = 20) : JComponent() {
     private var selEnd   = -1
 
     private var showCaret = true
-    private val caretTimer = Timer(500) { showCaret = !showCaret; repaint() }
+    
+    // Lifecycle-aware CoroutineScope and caret blink job
+    private var uiScope = CoroutineScope(Dispatchers.Swing + SupervisorJob())
+    private var caretJob: Job? = null
 
     private val changeListeners = ObjectArrayList<() -> Unit>()
     private val actionListeners = ObjectArrayList<() -> Unit>()
@@ -55,13 +55,37 @@ class GlyphTextField(columns: Int = 20) : JComponent() {
             repaint()
         }
 
+    private fun startCaretBlink() {
+        caretJob?.cancel()
+        caretJob = uiScope.launch {
+            while (isActive) {
+                delay(500)
+                showCaret = !showCaret
+                repaint()
+            }
+        }
+    }
+
     init {
         isOpaque = false
         isFocusable = true
         cursor = Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR)
         font = Font("SansSerif", Font.PLAIN, 13)
         preferredSize = Dimension(columns * 8 + 16, 28)
-        caretTimer.start()
+
+        // Bind coroutine lifecycle to displayability
+        addHierarchyListener { e ->
+            if ((e.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong()) != 0L) {
+                if (isDisplayable) {
+                    startCaretBlink()
+                } else {
+                    caretJob?.cancel()
+                }
+            }
+        }
+        if (isDisplayable) {
+            startCaretBlink()
+        }
 
         addFocusListener(object : FocusAdapter() {
             override fun focusGained(e: FocusEvent) { showCaret = true; repaint() }

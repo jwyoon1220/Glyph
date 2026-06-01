@@ -1,12 +1,12 @@
 package io.github.jwyoon1220.glyph
 
-import io.github.jwyoon1220.glyph.hangul.HangulUtil
-import io.github.jwyoon1220.glyph.hangul.KoreanMorphemeAnalyzer
+import io.github.jwyoon1220.glyph.hangul.koreanNouns
+import io.github.jwyoon1220.glyph.hangul.koreanTokens
 import io.github.jwyoon1220.glyph.search.DictionaryClient
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.swing.Swing
 import java.awt.*
 import java.awt.event.*
@@ -22,7 +22,7 @@ import javax.swing.border.LineBorder
 class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Scrollable {
 
     private companion object {
-        const val AI_SUGGESTION_DELAY_MS = 500
+        const val AI_SUGGESTION_DELAY_MS = 500L
         val GHOST_TEXT_COLOR = Color(128, 128, 128)
         /** Highlight colours for the in-editor search results. */
         val SEARCH_MATCH_COLOR  = Color(80, 65, 10)   // dark amber – all matches
@@ -30,7 +30,9 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     }
 
     private val pieceTable = PieceTable()
-    private val uiScope = CoroutineScope(Dispatchers.Swing + Job())
+    
+    // Lifecycle-aware CoroutineScope
+    private var uiScope = CoroutineScope(Dispatchers.Swing + SupervisorJob())
 
     private var caretOffset = 0
     private var selectionStart = -1
@@ -42,12 +44,17 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     private var hoveredWordBounds: IntRange? = null
     private var isCtrlDownForHover: Boolean = false
     private var popupWindow: JPopupMenu? = null
-    private var hoverTimer: Timer? = null
-    private var hideTimer: Timer? = null
+    
+    // Coroutine jobs replacing Swing Timers
+    private var hoverJob: Job? = null
+    private var hideJob: Job? = null
+    private var aiJob: Job? = null
 
     /** Listeners notified after a period of typing inactivity (for auto-commit). */
     private val typingStoppedListeners = ObjectArrayList<() -> Unit>()
-    private var inactivityTimer: Timer? = null
+
+    // SharedFlow to unify typing and edit events
+    private val editEventFlow = MutableSharedFlow<Unit>(replay = 0, extraBufferCapacity = 1)
 
     /** AI completion client (optional; set by owner). Supports Gemini, Groq, etc. */
     var aiClient: AiClient? = null
@@ -56,8 +63,6 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         get() = aiClient
         set(value) { aiClient = value }
     private var ghostText = ""
-    private var aiJob: kotlinx.coroutines.Job? = null
-    private var aiSuggestionTimer: Timer? = null
 
     /** Optional undo handler supplied by the owner (e.g. git-based restore). */
     var onUndoRequested: (() -> Unit)? = null
@@ -70,7 +75,6 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
     // Wiki autocomplete popup state
     private var autocompletePopup: JPopupMenu? = null
-    private var autocompleteTimer: Timer? = null
 
     // Search highlight state (controlled by FindBar via GlyphMainFrame)
     private val searchHighlightRanges = ObjectArrayList<IntRange>()
@@ -130,49 +134,28 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         }
     }
 
-    private fun resetInactivityTimer() {
-        inactivityTimer?.stop()
-        inactivityTimer = Timer(3000) {
-            typingStoppedListeners.forEach { it() }
-        }.also {
-            it.isRepeats = false
-            it.start()
-        }
-        resetAiSuggestionTimer()
+    private fun onTextEdited() {
+        clearGhostText()
+        editEventFlow.tryEmit(Unit)
     }
 
-    private fun resetAiSuggestionTimer() {
-        aiSuggestionTimer?.stop()
-        aiJob?.cancel()
-        aiJob = null
-        if (ghostText.isNotEmpty()) {
-            ghostText = ""
-            repaint()
-        }
-
+    private suspend fun triggerAiSuggestion() {
         val client = aiClient ?: return
         if (client.apiKey.isBlank()) return
+        if (caretOffset < pieceTable.length || compositionText.isNotEmpty()) return
+        val currentText = pieceTable.getText(0, pieceTable.length)
+        if (currentText.isBlank()) return
 
-        aiSuggestionTimer = Timer(AI_SUGGESTION_DELAY_MS) {
-            if (caretOffset < pieceTable.length || compositionText.isNotEmpty()) return@Timer
-            val currentText = pieceTable.getText(0, pieceTable.length)
-            if (currentText.isBlank()) return@Timer
-
-            aiJob = uiScope.launch {
-                val suggestion = client.getSuggestion(currentText)
-                if (isActive && suggestion.isNotBlank() && ghostText.isEmpty()) {
-                    ghostText = suggestion
-                    repaint()
-                }
+        aiJob = uiScope.launch {
+            val suggestion = client.getSuggestion(currentText)
+            if (isActive && suggestion.isNotBlank() && ghostText.isEmpty()) {
+                ghostText = suggestion
+                repaint()
             }
-        }.also {
-            it.isRepeats = false
-            it.start()
         }
     }
 
     private fun clearGhostText() {
-        aiSuggestionTimer?.stop()
         aiJob?.cancel()
         aiJob = null
         if (ghostText.isNotEmpty()) {
@@ -237,18 +220,14 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             || c in '\u3131'..'\u314E'  // Korean consonant jamo
             || c in '\u314F'..'\u3163' // Korean vowel jamo
 
-    /** Schedules an autocomplete lookup after a short debounce delay. */
-    private fun scheduleAutocomplete() {
-        autocompleteTimer?.stop()
+    private fun triggerAutocomplete() {
         val indexer = wikiIndexer ?: return
         val prefix = currentWordBeforeCaret()
         if (prefix.length < 2) { dismissAutocomplete(); return }
 
-        autocompleteTimer = Timer(150) {
-            val suggestions = indexer.getSuggestions(prefix)
-            if (suggestions.isEmpty()) { dismissAutocomplete(); return@Timer }
-            showAutocompletePopup(suggestions, prefix)
-        }.apply { isRepeats = false; start() }
+        val suggestions = indexer.getSuggestions(prefix)
+        if (suggestions.isEmpty()) { dismissAutocomplete(); return }
+        showAutocompletePopup(suggestions, prefix)
     }
 
     private fun showAutocompletePopup(suggestions: List<String>, prefix: String) {
@@ -270,7 +249,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         caretOffset += completionSuffix.length
                     }
                     clearSelection()
-                    resetInactivityTimer()
+                    onTextEdited()
                     repaint()
                 }
             }
@@ -296,7 +275,6 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     }
 
     private fun dismissAutocomplete() {
-        autocompleteTimer?.stop()
         autocompletePopup?.isVisible = false
         autocompletePopup = null
     }
@@ -316,19 +294,19 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
         val st = StringTokenizer(selectedText, " .,!?\n\t")
         val cleanWord = if (st.hasMoreTokens()) st.nextToken() else selectedText
-        val analyzer = KoreanMorphemeAnalyzer(cleanWord)
-        val targetWord = analyzer.extractNouns().firstOrNull() ?: cleanWord
+        val targetWord = cleanWord.koreanNouns.firstOrNull() ?: cleanWord
 
-        val sbToken = java.lang.StringBuilder()
-        for (token in analyzer.getTokens()) {
-            val color = when {
-                token.pos.startsWith("N") -> "#9876AA"
-                token.pos.startsWith("J") -> "#CC7832"
-                token.pos.startsWith("V") -> "#FFC66D"
-                token.pos.startsWith("M") -> "#6A8759"
-                else -> "#A9B7C6"
+        val sbToken = buildString {
+            for (token in cleanWord.koreanTokens) {
+                val color = when {
+                    token.pos.startsWith("N") -> "#9876AA"
+                    token.pos.startsWith("J") -> "#CC7832"
+                    token.pos.startsWith("V") -> "#FFC66D"
+                    token.pos.startsWith("M") -> "#6A8759"
+                    else -> "#A9B7C6"
+                }
+                append("<span style='color: $color;'>${token.morph}</span>")
             }
-            sbToken.append("<span style='color: $color;'>${token.morph}</span>")
         }
 
         // Calculate position: find the line containing `start`
@@ -347,7 +325,48 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
             }
             off += len
         }
-        showDictionaryPopup(targetWord, sbToken.toString(), popupX, popupY)
+        showDictionaryPopup(targetWord, sbToken, popupX, popupY)
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    private fun startCoroutines() {
+        uiScope.coroutineContext[Job]?.cancelChildren()
+
+        // 1. Caret Blink
+        uiScope.launch {
+            while (isActive) {
+                delay(500)
+                showCaret = !showCaret
+                repaint()
+            }
+        }
+
+        // 2. Typing Inactivity (Auto-save / Git Commit) -> Debounce 3000ms
+        uiScope.launch {
+            editEventFlow
+                .debounce(3000)
+                .collect {
+                    typingStoppedListeners.forEach { it() }
+                }
+        }
+
+        // 3. AI Suggestion -> Debounce 500ms
+        uiScope.launch {
+            editEventFlow
+                .debounce(AI_SUGGESTION_DELAY_MS)
+                .collectLatest {
+                    triggerAiSuggestion()
+                }
+        }
+
+        // 4. Autocomplete -> Debounce 150ms
+        uiScope.launch {
+            editEventFlow
+                .debounce(150)
+                .collectLatest {
+                    triggerAutocomplete()
+                }
+        }
     }
 
     init {
@@ -361,10 +380,19 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         cursor = Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR)
         enableInputMethods(true)
 
-        Timer(500) {
-            showCaret = !showCaret
-            repaint()
-        }.start()
+        // Bind coroutine lifecycle to displayability
+        addHierarchyListener { e ->
+            if ((e.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong()) != 0L) {
+                if (isDisplayable) {
+                    startCoroutines()
+                } else {
+                    uiScope.coroutineContext[Job]?.cancelChildren()
+                }
+            }
+        }
+        if (isDisplayable) {
+            startCoroutines()
+        }
 
         addInputMethodListener(object : InputMethodListener {
             override fun inputMethodTextChanged(event: InputMethodEvent) {
@@ -385,7 +413,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     if (safeInsert(caretOffset, comText)) {
                         caretOffset += comText.length
                     }
-                    resetInactivityTimer()
+                    onTextEdited()
                 }
                 
                 compositionText = if (composed.length > committed) composed.substring(committed) else ""
@@ -409,8 +437,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         caretOffset++
                     }
                     showCaret = true
-                    resetInactivityTimer()
-                    scheduleAutocomplete()
+                    onTextEdited()
                     repaint()
                 }
             }
@@ -430,7 +457,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         }
                         ghostText = ""
                         clearSelection()
-                        resetInactivityTimer()
+                        onTextEdited()
                         showCaret = true
                         repaint()
                     }
@@ -446,10 +473,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
 
                 // Any other key press dismisses the ghost text
                 if (ghostText.isNotEmpty()) {
-                    aiSuggestionTimer?.stop()
-                    aiJob?.cancel()
-                    aiJob = null
-                    ghostText = ""
+                    clearGhostText()
                 }
 
                 if (shift && selectionStart == -1) {
@@ -474,7 +498,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                             caretOffset++
                         }
                         clearSelection()
-                        resetInactivityTimer()
+                        onTextEdited()
                     }
                     KeyEvent.VK_BACK_SPACE -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) {
@@ -483,7 +507,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                             pieceTable.delete(caretOffset - 1, 1)
                             caretOffset--
                         }
-                        resetInactivityTimer()
+                        onTextEdited()
                     }
                     KeyEvent.VK_DELETE -> {
                         if (selectionStart != -1 && selectionStart != selectionEnd) {
@@ -491,7 +515,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         } else if (caretOffset < pieceTable.length) {
                             pieceTable.delete(caretOffset, 1)
                         }
-                        resetInactivityTimer()
+                        onTextEdited()
                     }
                     KeyEvent.VK_Z -> if (ctrl) {
                         onUndoRequested?.invoke()
@@ -566,16 +590,16 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     hoveredWordBounds = bounds
                     repaint()
 
-                    hoverTimer?.stop()
+                    hoverJob?.cancel()
                     scheduleHidePopup()
 
                     if (bounds != null) {
-                        scheduleHoverInfo(bounds, if (e.isControlDown) 300 else 500, e.x, e.y)
+                        scheduleHoverInfo(bounds, if (e.isControlDown) 300L else 500L, e.x, e.y)
                     }
                 } else if (bounds != null && wasCtrlDown != isCtrlDownForHover) {
                     repaint()
                     if (isCtrlDownForHover) {
-                        scheduleHoverInfo(bounds, 300, e.x, e.y)
+                        scheduleHoverInfo(bounds, 300L, e.x, e.y)
                     }
                 } else if (bounds == null) {
                     if (popupWindow?.isVisible == true) {
@@ -609,10 +633,11 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
     }
 
     private fun scheduleHidePopup() {
-        hideTimer?.stop()
+        hideJob?.cancel()
         if (popupWindow?.isVisible != true) return
         
-        hideTimer = Timer(300) {
+        hideJob = uiScope.launch {
+            delay(300)
             var isInPopup = false
             try {
                 val mouseLoc = MouseInfo.getPointerInfo()?.location
@@ -625,46 +650,41 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                         if (rect.contains(mouseLoc)) isInPopup = true
                     }
                 }
-            } catch (ex: Exception) {}
+            } catch (_: Exception) {}
             
             if (!isInPopup) {
                 popupWindow?.isVisible = false
             }
-        }.apply {
-            isRepeats = false
-            start()
         }
     }
 
-    private fun scheduleHoverInfo(bounds: IntRange, delay: Int, pointerX: Int, pointerY: Int) {
-        hoverTimer?.stop()
+    private fun scheduleHoverInfo(bounds: IntRange, delayMs: Long, pointerX: Int, pointerY: Int) {
+        hoverJob?.cancel()
         if (popupWindow?.isVisible == true) return // Do not reschedule if already showing
         
-        hoverTimer = Timer(delay) {
+        hoverJob = uiScope.launch {
+            delay(delayMs)
             val rawWord = pieceTable.getText(0, pieceTable.length).substring(bounds.first, bounds.last + 1)
             val st = StringTokenizer(rawWord, " .,!?\n\t")
             if (st.hasMoreTokens()) {
                 val cleanWord = st.nextToken()
-                val analyzer = io.github.jwyoon1220.glyph.hangul.KoreanMorphemeAnalyzer(cleanWord)
-                val targetWord = analyzer.extractNouns().firstOrNull() ?: cleanWord
+                val targetWord = cleanWord.koreanNouns.firstOrNull() ?: cleanWord
                 
-                val sbToken = java.lang.StringBuilder()
-                for (token in analyzer.getTokens()) {
-                    val color = when {
-                        token.pos.startsWith("N") -> "#9876AA" // Noun: Purple
-                        token.pos.startsWith("J") -> "#CC7832" // Josa: Orange
-                        token.pos.startsWith("V") -> "#FFC66D" // Verb: Yellow
-                        token.pos.startsWith("M") -> "#6A8759" // Modifier: Green
-                        else -> "#A9B7C6" // Default Gray
+                val sbToken = buildString {
+                    for (token in cleanWord.koreanTokens) {
+                        val color = when {
+                            token.pos.startsWith("N") -> "#9876AA" // Noun: Purple
+                            token.pos.startsWith("J") -> "#CC7832" // Josa: Orange
+                            token.pos.startsWith("V") -> "#FFC66D" // Verb: Yellow
+                            token.pos.startsWith("M") -> "#6A8759" // Modifier: Green
+                            else -> "#A9B7C6" // Default Gray
+                        }
+                        append("<span style='color: $color;'>${token.morph}</span>")
                     }
-                    sbToken.append("<span style='color: $color;'>${token.morph}</span>")
                 }
                 
-                showDictionaryPopup(targetWord, sbToken.toString(), pointerX, pointerY)
+                showDictionaryPopup(targetWord, sbToken, pointerX, pointerY)
             }
-        }.apply {
-            isRepeats = false
-            start()
         }
     }
 
@@ -690,7 +710,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 scheduleHidePopup()
             }
             override fun mouseEntered(e: MouseEvent) {
-                hideTimer?.stop()
+                hideJob?.cancel()
             }
         }
         textPane.addMouseListener(closePopupAdapter)
@@ -704,22 +724,23 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         val htmlSuffix = "</body></html>"
         val headerHtml = "<div style='font-size: 16px; margin-bottom: 6px;'><b>$styledWord</b></div><hr style='border: 0; border-top: 1px solid #4C5052; margin-top: 0px; margin-bottom: 8px;'/>"
 
-        textPane.text = "$htmlPrefix$headerHtml<i>단어 뜻을 찾는 중...</i>$htmlSuffix"
+        textPane.text = "$htmlPrefix${headerHtml}<i>단어 뜻을 찾는 중...</i>$htmlSuffix"
 
         uiScope.launch {
             val results = dictClient.searchWord(word)
             if (results.isEmpty()) {
                 textPane.text = htmlPrefix + headerHtml + "사전에서 뜻을 찾을 수 없습니다." + htmlSuffix
             } else {
-                val sb = java.lang.StringBuilder()
-                for (item in results) {
-                    sb.append("<div style='margin-bottom: 4px;'>")
-                    sb.append("<span style='color: #6AAB73; font-weight: bold;'>【${item.word}】</span> ")
-                    if (item.pos.isNotEmpty()) sb.append("<span style='color: #E8BF6A;'>[${item.pos}]</span> ")
-                    sb.append("</div>")
-                    sb.append("<div style='margin-bottom: 12px; margin-left: 10px; line-height: 1.4;'>${item.sense.definition}</div>")
+                val sb = buildString {
+                    for (item in results) {
+                        append("<div style='margin-bottom: 4px;'>")
+                        append("<span style='color: #6AAB73; font-weight: bold;'>【${item.word}】</span> ")
+                        if (item.pos.isNotEmpty()) append("<span style='color: #E8BF6A;'>[${item.pos}]</span> ")
+                        append("</div>")
+                        append("<div style='margin-bottom: 12px; margin-left: 10px; line-height: 1.4;'>${item.sense.definition}</div>")
+                    }
                 }
-                textPane.text = htmlPrefix + headerHtml + sb.toString() + htmlSuffix
+                textPane.text = htmlPrefix + headerHtml + sb + htmlSuffix
                 textPane.caretPosition = 0
             }
         }
@@ -731,7 +752,7 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         val hasClipboard = try {
             val cb = Toolkit.getDefaultToolkit().systemClipboard.getContents(null)
             cb?.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.stringFlavor) == true
-        } catch (ex: Exception) { false }
+        } catch (_: Exception) { false }
 
         val menu = JPopupMenu()
 
@@ -1042,9 +1063,6 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                 
                 // 3. Draw Suffix (Offset by composition width)
                 g2d.drawString(suffix, currentX, y)
-
-                // Handover caret position for later caret drawing
-                // (cx is usually after composition)
             } else {
                 g2d.drawString(lineStr, 0, y)
             }
@@ -1058,8 +1076,6 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
                     val overlapStart = maxOf(0, wStart - lineStart)
                     val overlapEnd = minOf(lineStr.length, wEnd - lineStart)
                     
-                    // Simple underline for word hover (Note: this doesn't account for composition offset 
-                    // because hover is unlikely during composition, but for correctness we draw on raw lineStr)
                     val hPrefix = lineStr.substring(0, overlapStart)
                     val hWord = lineStr.substring(overlapStart, overlapEnd)
                     val hx = fm.stringWidth(hPrefix)
@@ -1134,4 +1150,4 @@ class GlyphTextArea(private val dictClient: DictionaryClient) : JComponent(), Sc
         revalidate()
         super.repaint()
     }
-}
+}

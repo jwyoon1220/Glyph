@@ -3,6 +3,8 @@ package io.github.jwyoon1220.glyph
 import io.github.jwyoon1220.glyph.data.WikiGraph
 import io.github.jwyoon1220.glyph.data.WikiNode
 import io.github.jwyoon1220.glyph.data.WikiNodeType
+import kotlinx.coroutines.*
+import kotlinx.coroutines.swing.Swing
 import java.awt.*
 import java.awt.event.*
 import java.awt.geom.CubicCurve2D
@@ -23,10 +25,22 @@ class WikiGraphEditorComponent(
 
     private val canvas = NodeCanvas()
     var onTypingStopped: (() -> Unit)? = null
-    private var saveTimer: Timer? = null
+    
+    // Lifecycle-aware CoroutineScope and debounce job
+    private var uiScope = CoroutineScope(Dispatchers.Swing + SupervisorJob())
+    private var saveJob: Job? = null
 
     init {
         background = Color(20, 20, 20)
+        
+        // Bind coroutine lifecycle to displayability
+        addHierarchyListener { e ->
+            if ((e.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong()) != 0L) {
+                if (!isDisplayable) {
+                    uiScope.coroutineContext[Job]?.cancelChildren()
+                }
+            }
+        }
         
         // Toolbar
         val topBar = JPanel(FlowLayout(FlowLayout.LEFT)).apply {
@@ -63,13 +77,11 @@ class WikiGraphEditorComponent(
     }
 
     fun triggerSave() {
-        saveTimer?.stop()
-        saveTimer = Timer(1000) {
+        saveJob?.cancel()
+        saveJob = uiScope.launch {
+            delay(1000)
             onStructureChanged(graph)
             onTypingStopped?.invoke()
-        }.apply {
-            isRepeats = false
-            start()
         }
     }
 
@@ -182,7 +194,6 @@ class WikiGraphEditorComponent(
         }
 
         fun updateCanvasSize() {
-            // Under zoom/pan, we keep a large virtual area or just let panning handle it
             preferredSize = Dimension(5000, 5000)
             revalidate()
         }
@@ -232,7 +243,6 @@ class WikiGraphEditorComponent(
             g2d.transform = oldAt
         }
         
-        // Since we are using JComponents as nodes, we need to transform their drawing too
         override fun paintChildren(g: Graphics) {
             val g2d = g as Graphics2D
             val oldAt = g2d.transform
@@ -242,7 +252,6 @@ class WikiGraphEditorComponent(
             g2d.transform = oldAt
         }
         
-        // Override getComponentAt to handle scaled/panned children
         override fun getComponentAt(x: Int, y: Int): Component? {
             val tx = (x - panX) / scale
             val ty = (y - panY) / scale
@@ -369,7 +378,6 @@ class WikiGraphEditorComponent(
             add(body, BorderLayout.CENTER)
             
             // --- PORTS ---
-            // Just simple buttons on left/right edges for drawing lines
             val portPanel = JPanel(BorderLayout()).apply { isOpaque = false; preferredSize = Dimension(200, 10) }
             val portOut = JButton("●").apply {
                 margin = Insets(0, 0, 0, 0)
@@ -384,7 +392,6 @@ class WikiGraphEditorComponent(
                         canvas.draggingConnectionStartNode = node
                     }
                     override fun mouseReleased(e: MouseEvent) {
-                        // Pass event to canvas
                         val p = SwingUtilities.convertPoint(e.component, e.point, canvas)
                         val ev = MouseEvent(canvas, e.id, e.`when`, e.modifiersEx, p.x, p.y, e.clickCount, e.isPopupTrigger)
                         canvas.mouseListeners.forEach { it.mouseReleased(ev) }
@@ -399,8 +406,6 @@ class WikiGraphEditorComponent(
                 addMouseMotionListener(portDrag)
             }
             portPanel.add(portOut, BorderLayout.EAST)
-            
-            // Add ports to the wrapper
             add(portPanel, BorderLayout.SOUTH)
         }
     }

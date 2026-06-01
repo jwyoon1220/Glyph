@@ -1,12 +1,13 @@
 package io.github.jwyoon1220.glyph.search
 
-import io.github.jwyoon1220.glyph.data.StorageRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Path
@@ -14,18 +15,19 @@ import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchService
 
 /**
- * Watches [watchRoot] for changes to Markdown (.md) and settings (.glb) files
- * and immediately (re-)indexes their content into [luceneSearcher].
- *
- * Indexing runs on [Dispatchers.IO] so it never blocks the Swing EDT.
+ * Watches [watchRoot] for file creation and modification events and exposes them
+ * as a reactive [SharedFlow] of [File]s.
  */
-class FileWatcher(
-    private val watchRoot: File,
-    private val luceneSearcher: LuceneSearcher,
-    private val storageRepository: StorageRepository
-) {
+class FileWatcher(private val watchRoot: File) {
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private lateinit var watchService: WatchService
+
+    private val _eventFlow = MutableSharedFlow<File>(extraBufferCapacity = 64)
+    
+    /**
+     * A reactive stream of changed files.
+     */
+    val eventFlow: SharedFlow<File> = _eventFlow.asSharedFlow()
 
     fun start() {
         scope.launch {
@@ -50,8 +52,8 @@ class FileWatcher(
                     // If a new directory was created, register it so its files are watched too
                     if (kind == StandardWatchEventKinds.ENTRY_CREATE && file.isDirectory) {
                         registerDirectory(file.toPath())
-                    } else {
-                        indexFile(file)
+                    } else if (file.isFile) {
+                        _eventFlow.tryEmit(file)
                     }
                 }
                 if (!key.reset()) break
@@ -67,28 +69,6 @@ class FileWatcher(
                 StandardWatchEventKinds.ENTRY_CREATE,
                 StandardWatchEventKinds.ENTRY_MODIFY
             )
-        }
-    }
-
-    private suspend fun indexFile(file: File) {
-        when {
-            file.name.endsWith(".md") || file.name.endsWith(".gle")
-                    || file.name.endsWith(".glp") || file.name.endsWith(".glw")
-                    || file.name.endsWith(".glhr") -> {
-                if (file.canRead()) {
-                    val content = withContext(Dispatchers.IO) { file.readText() }
-                    luceneSearcher.indexDocument(file.nameWithoutExtension, content)
-                }
-            }
-            file.name.endsWith(".glh") -> {
-                // .glh is gzip-compressed markdown — read via StorageRepository
-                val relPath = file.relativeTo(watchRoot).path.replace('\\', '/')
-                val content = storageRepository.loadFile(relPath)
-                if (content.isNotEmpty()) luceneSearcher.indexDocument(file.nameWithoutExtension, content)
-            }
-            file.name.endsWith(".glb") -> {
-                luceneSearcher.indexDocument(file.nameWithoutExtension, file.name)
-            }
         }
     }
 

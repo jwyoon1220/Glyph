@@ -7,6 +7,7 @@ import io.github.jwyoon1220.glyph.search.DictionaryClient
 import io.github.jwyoon1220.glyph.search.FileWatcher
 import io.github.jwyoon1220.glyph.search.LuceneSearcher
 import io.github.jwyoon1220.glyph.vcs.GitManager
+import io.github.jwyoon1220.glyph.hangul.koreanTokens
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap
 import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import kotlinx.coroutines.*
@@ -23,7 +24,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     private val gitManager = GitManager(dataRoot)
     private val dictClient = DictionaryClient()
     private val luceneSearcher = LuceneSearcher()
-    private val fileWatcher = FileWatcher(dataRoot, luceneSearcher, repo)
+    private val fileWatcher = FileWatcher(dataRoot)
     private val wikiIndexer = WikiIndexer()
 
     private val prefs = java.util.prefs.Preferences.userNodeForPackage(GlyphMainFrame::class.java)
@@ -86,6 +87,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
 
     /** Right-panel pane that displays morphological analysis for selected text. */
     private val morphAnalysisPane = JTextPane().apply {
+        isOpaque = true
         isEditable = false
         contentType = "text/html"
         background = Color(43, 45, 48)
@@ -93,7 +95,7 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     }
 
     // Coroutine Scope for UI
-    private val uiScope = CoroutineScope(Dispatchers.Swing + Job())
+    private val uiScope = CoroutineScope(Dispatchers.Swing + SupervisorJob())
 
     init {
         size = Dimension(1280, 800)
@@ -137,36 +139,19 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         // Start the file watcher for real-time Lucene indexing
         fileWatcher.start()
 
+        // Reactively collect and index file changes
+        uiScope.launch {
+            fileWatcher.eventFlow.collect { file ->
+                indexFile(file)
+            }
+        }
+
         // Background scan: index all existing project files on startup
-        uiScope.launch(Dispatchers.IO) {
+        uiScope.launch {
             dataRoot.walkTopDown()
                 .filter { it.isFile && !it.name.startsWith(".") }
                 .forEach { file ->
-                    try {
-                        val content = when {
-                            file.name.endsWith(".gle") || file.name.endsWith(".md") ||
-                            file.name.endsWith(".glhr") || file.name.endsWith(".glp") ->
-                                file.readText()
-                            file.name.endsWith(".glh") -> {
-                                val relPath = file.relativeTo(dataRoot).path.replace('\\', '/')
-                                repo.loadFile(relPath)
-                            }
-                            file.name.endsWith(".glw") -> {
-                                val relPath = file.relativeTo(dataRoot).path.replace('\\', '/')
-                                val graph = repo.loadWiki(relPath)
-                                if (graph != null) {
-                                    wikiIndexer.indexGraph(graph)
-                                }
-                                graph?.nodes?.joinToString(" ") { it.title + " " + it.content } ?: ""
-                            }
-                            else -> return@forEach
-                        }
-                        if (content.isNotEmpty()) {
-                            luceneSearcher.indexDocument(file.nameWithoutExtension, content)
-                        }
-                    } catch (e: Exception) {
-                        System.err.println("[GlyphMainFrame] Failed to index '${file.path}': ${e.message}")
-                    }
+                    indexFile(file)
                 }
         }
 
@@ -178,6 +163,34 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
 
         // Initial status bar refresh
         refreshStatusBar()
+    }
+
+    private suspend fun indexFile(file: File) = withContext(Dispatchers.IO) {
+        try {
+            val content = when {
+                file.name.endsWith(".gle") || file.name.endsWith(".md") ||
+                file.name.endsWith(".glhr") || file.name.endsWith(".glp") ->
+                    file.readText()
+                file.name.endsWith(".glh") -> {
+                    val relPath = file.relativeTo(dataRoot).path.replace('\\', '/')
+                    repo.loadFile(relPath)
+                }
+                file.name.endsWith(".glw") -> {
+                    val relPath = file.relativeTo(dataRoot).path.replace('\\', '/')
+                    val graph = repo.loadWiki(relPath)
+                    if (graph != null) {
+                        wikiIndexer.indexGraph(graph)
+                    }
+                    graph?.nodes?.joinToString(" ") { it.title + " " + it.content } ?: ""
+                }
+                else -> return@withContext
+            }
+            if (content.isNotEmpty()) {
+                luceneSearcher.indexDocument(file.nameWithoutExtension, content)
+            }
+        } catch (e: Exception) {
+            System.err.println("[GlyphMainFrame] Failed to index '${file.path}': ${e.message}")
+        }
     }
 
     private fun createStatusBar(): JPanel {
@@ -355,59 +368,55 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
     /**
      * Updates the morphological analysis panel in the right tool window with
      * a colour-coded breakdown of the selected text.
-     * Komoran analysis runs on the Swing dispatcher (consistent with hover popup).
-     * The 300-character cap keeps execution time short enough to avoid stutter.
      */
     private fun updateMorphAnalysisPanel(selectedText: String) {
         if (selectedText.isBlank()) {
             morphAnalysisPane.text = ""
             return
         }
-        // Run on Swing (EDT-equivalent) so Komoran's internal state is accessed
-        // from a single thread, matching the existing hover-popup code path.
         uiScope.launch {
             val sentence = selectedText.take(300)
-            val sb = StringBuilder()
-            sb.append("<html><body style='font-family:sans-serif;font-size:13px;color:#A9B7C6;margin:4px;'>")
-            sb.append("<div style='font-size:11px;color:#6A9955;margin-bottom:6px;'>형태소 분석 (Ctrl+T: 유의어)</div>")
+            val html = buildString {
+                append("<html><body style='font-family:sans-serif;font-size:13px;color:#A9B7C6;margin:4px;'>")
+                append("<div style='font-size:11px;color:#6A9955;margin-bottom:6px;'>형태소 분석 (Ctrl+T: 유의어)</div>")
 
-            try {
-                val analyzer = io.github.jwyoon1220.glyph.hangul.KoreanMorphemeAnalyzer(sentence)
-                for (token in analyzer.getTokens()) {
-                    val color = when {
-                        token.pos.startsWith("N") -> "#9876AA"
-                        token.pos.startsWith("J") -> "#CC7832"
-                        token.pos.startsWith("V") -> "#FFC66D"
-                        token.pos.startsWith("M") -> "#6A8759"
-                        else -> "#A9B7C6"
+                try {
+                    for (token in sentence.koreanTokens) {
+                        val color = when {
+                            token.pos.startsWith("N") -> "#9876AA"
+                            token.pos.startsWith("J") -> "#CC7832"
+                            token.pos.startsWith("V") -> "#FFC66D"
+                            token.pos.startsWith("M") -> "#6A8759"
+                            else -> "#A9B7C6"
+                        }
+                        append("<span style='color:$color;' title='${token.pos}'>${token.morph}</span>")
+                        append("<span style='color:#4C5052;font-size:10px;'>/</span>")
+                        append("<span style='color:$color;font-size:10px;'>${token.pos}</span> ")
                     }
-                    sb.append("<span style='color:$color;' title='${token.pos}'>${token.morph}</span>")
-                    sb.append("<span style='color:#4C5052;font-size:10px;'>/</span>")
-                    sb.append("<span style='color:$color;font-size:10px;'>${token.pos}</span> ")
+                } catch (e: Exception) {
+                    System.err.println("[GlyphMainFrame] Morphological analysis failed: ${e.message}")
+                    append(sentence)
                 }
-            } catch (e: Exception) {
-                System.err.println("[GlyphMainFrame] Morphological analysis failed: ${e.message}")
-                sb.append(sentence)
-            }
 
-            // Show wiki term matches for the selected text (ConcurrentHashMap — safe on any thread)
-            val wikiMatches = wikiIndexer.getSuggestions(selectedText.trim(), limit = 3, minPrefixLength = 1)
-            if (wikiMatches.isNotEmpty()) {
-                sb.append("<hr style='border:0;border-top:1px solid #3C4050;margin:6px 0;'/>")
-                sb.append("<div style='font-size:11px;color:#6A9955;margin-bottom:4px;'>Wiki 관련 항목</div>")
-                for (term in wikiMatches) {
-                    val excerpt = wikiIndexer.getExcerpt(term)?.take(80) ?: ""
-                    sb.append("<div style='margin-bottom:4px;'>")
-                    sb.append("<span style='color:#82AAFF;font-weight:bold;'>$term</span>")
-                    if (excerpt.isNotEmpty()) {
-                        sb.append("<div style='color:#777;font-size:11px;margin-left:8px;'>$excerpt…</div>")
+                // Show wiki term matches for the selected text (ConcurrentHashMap — safe on any thread)
+                val wikiMatches = wikiIndexer.getSuggestions(selectedText.trim(), limit = 3, minPrefixLength = 1)
+                if (wikiMatches.isNotEmpty()) {
+                    append("<hr style='border:0;border-top:1px solid #3C4050;margin:6px 0;'/>")
+                    append("<div style='font-size:11px;color:#6A9955;margin-bottom:4px;'>Wiki 관련 항목</div>")
+                    for (term in wikiMatches) {
+                        val excerpt = wikiIndexer.getExcerpt(term)?.take(80) ?: ""
+                        append("<div style='margin-bottom:4px;'>")
+                        append("<span style='color:#82AAFF;font-weight:bold;'>$term</span>")
+                        if (excerpt.isNotEmpty()) {
+                            append("<div style='color:#777;font-size:11px;margin-left:8px;'>$excerpt…</div>")
+                        }
+                        append("</div>")
                     }
-                    sb.append("</div>")
                 }
-            }
 
-            sb.append("</body></html>")
-            morphAnalysisPane.text = sb.toString()
+                append("</body></html>")
+            }
+            morphAnalysisPane.text = html
             morphAnalysisPane.caretPosition = 0
         }
     }
@@ -510,16 +519,17 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
                     val html = if (results.isEmpty()) {
                         "${htmlPrefix}결과 없음: '${query}'${htmlSuffix}"
                     } else {
-                        val sb = StringBuilder(htmlPrefix)
-                        for (item in results) {
-                            sb.append("<div style='margin-bottom:4px;'>")
-                            sb.append("<span style='color:#6AAB73;font-weight:bold;'>【${item.word}】</span> ")
-                            if (item.pos.isNotEmpty()) sb.append("<span style='color:#E8BF6A;'>[${item.pos}]</span>")
-                            sb.append("</div>")
-                            sb.append("<div style='margin-bottom:10px;margin-left:10px;'>${item.sense.definition}</div>")
+                        buildString {
+                            append(htmlPrefix)
+                            for (item in results) {
+                                append("<div style='margin-bottom:4px;'>")
+                                append("<span style='color:#6AAB73;font-weight:bold;'>【${item.word}】</span> ")
+                                if (item.pos.isNotEmpty()) append("<span style='color:#E8BF6A;'>[${item.pos}]</span>")
+                                append("</div>")
+                                append("<div style='margin-bottom:10px;margin-left:10px;'>${item.sense.definition}</div>")
+                            }
+                            append(htmlSuffix)
                         }
-                        sb.append(htmlSuffix)
-                        sb.toString()
                     }
                     resultPane.text = html
                     resultPane.caretPosition = 0
@@ -554,7 +564,8 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
         panel.border = BorderFactory.createTitledBorder(BorderFactory.createLineBorder(Color.DARK_GRAY), "Version Control")
         (panel.border as javax.swing.border.TitledBorder).titleColor = Color.LIGHT_GRAY
 
-        val gitLogComponent = io.github.jwyoon1220.glyph.vcs.GitLogComponent(gitManager) { commitHash ->
+        lateinit var gitLogComponent: io.github.jwyoon1220.glyph.vcs.GitLogComponent
+        gitLogComponent = io.github.jwyoon1220.glyph.vcs.GitLogComponent(gitManager) { commitHash ->
             val confirm = JOptionPane.showConfirmDialog(
                 panel,
                 "이 커밋으로 롤백하시겠습니까?\n커밋 이후의 모든 변경 사항이 사라집니다.",
@@ -885,9 +896,9 @@ class GlyphMainFrame(val dataRoot: File) : JFrame("Glyph - ${dataRoot.name}") {
             }
         }
     }
+}
 
 fun main() {
-    // Ultra High-Performance Hardware Acceleration using JNI to Native Window APIs
     System.setProperty("sun.java2d.opengl", "true")
     System.setProperty("sun.java2d.d3d", "true")
     System.setProperty("sun.java2d.noddraw", "false")
@@ -897,7 +908,6 @@ fun main() {
     System.setProperty("swing.aatext", "true")
 
     SwingUtilities.invokeLater {
-        // Enable Hardware Accelerated Custom Native JNI window decorations
         FlatLaf.registerCustomDefaultsSource("io.github.jwyoon1220.glyph")
         System.setProperty("flatlaf.useWindowDecorations", "true")
         System.setProperty("flatlaf.menuBarEmbedded", "true")
